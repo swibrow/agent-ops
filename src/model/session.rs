@@ -14,6 +14,19 @@ pub enum AgentActivity {
     Unknown,
 }
 
+impl AgentActivity {
+    /// Sort priority — lower = shown first in the dashboard.
+    /// Needs-attention sessions float to the top.
+    pub fn sort_priority(&self) -> u8 {
+        match self {
+            Self::WaitingForPermission => 0,
+            Self::Processing => 1,
+            Self::Unknown => 2,
+            Self::WaitingForInput => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SessionStatus {
     Active,

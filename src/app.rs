@@ -271,6 +271,15 @@ impl App {
             }
         }
 
+        // Sort active sessions: needs-attention first, then processing, then idle.
+        // Within the same activity state, sort by project name for stability.
+        self.active_sessions.sort_by(|a, b| {
+            a.activity
+                .sort_priority()
+                .cmp(&b.activity.sort_priority())
+                .then_with(|| a.project_name.cmp(&b.project_name))
+        });
+
         // Clear any previous error on successful refresh
         self.last_error = None;
 
