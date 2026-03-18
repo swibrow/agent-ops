@@ -64,6 +64,10 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if app.show_help {
         draw_help_overlay(frame, area);
     }
+
+    if app.show_quit_confirm {
+        draw_quit_confirm(frame, area);
+    }
 }
 
 fn draw_too_small(frame: &mut Frame, area: Rect) {
@@ -234,6 +238,37 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     );
 
     frame.render_widget(help, popup_area);
+}
+
+fn draw_quit_confirm(frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(35, 20, area);
+    frame.render_widget(Clear, popup);
+
+    let text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Quit agent-ops?",
+            Style::default().fg(Color::Yellow).bold(),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [y/Enter] ", Style::default().fg(Color::Green)),
+            Span::styled("Yes", Style::default().fg(Color::White)),
+            Span::styled("    [any] ", Style::default().fg(Color::Red)),
+            Span::styled("Cancel", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let paragraph = ratatui::widgets::Paragraph::new(text)
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .padding(Padding::new(1, 1, 0, 0)),
+        );
+
+    frame.render_widget(paragraph, popup);
 }
 
 pub fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {

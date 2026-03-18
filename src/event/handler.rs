@@ -9,10 +9,20 @@ pub fn handle_key_event(key: KeyEvent, app: &App) -> Action {
         return handle_search_key(key);
     }
 
+    // If quit confirmation is showing
+    if app.show_quit_confirm {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Char('q') | KeyCode::Enter => Action::Quit,
+            _ => Action::CancelQuit,
+        };
+    }
+
     // Global keys first
     match key.code {
-        KeyCode::Char('q') => return Action::Quit,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Action::Quit,
+        KeyCode::Char('q') => return Action::RequestQuit,
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Action::Quit
+        }
         KeyCode::Char('1') => return Action::SwitchTab(ActiveView::Dashboard),
         KeyCode::Char('2') => return Action::SwitchTab(ActiveView::Projects),
         KeyCode::Char('3') => return Action::SwitchTab(ActiveView::History),
@@ -95,11 +105,11 @@ mod tests {
     // ── Global keys ──────────────────────────────────────────────
 
     #[test]
-    fn q_produces_quit() {
+    fn q_produces_request_quit() {
         let app = default_app();
         assert_eq!(
             handle_key_event(key(KeyCode::Char('q')), &app),
-            Action::Quit
+            Action::RequestQuit
         );
     }
 
@@ -247,6 +257,52 @@ mod tests {
         assert_eq!(
             handle_key_event(key(KeyCode::Char('R')), &app),
             Action::Refresh
+        );
+    }
+
+    // ── Quit confirmation ─────────────────────────────────────────
+
+    #[test]
+    fn y_confirms_quit() {
+        let mut app = default_app();
+        app.show_quit_confirm = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('y')), &app),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn q_confirms_quit() {
+        let mut app = default_app();
+        app.show_quit_confirm = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('q')), &app),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn enter_confirms_quit() {
+        let mut app = default_app();
+        app.show_quit_confirm = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Enter), &app),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn other_key_cancels_quit() {
+        let mut app = default_app();
+        app.show_quit_confirm = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('n')), &app),
+            Action::CancelQuit
+        );
+        assert_eq!(
+            handle_key_event(key(KeyCode::Esc), &app),
+            Action::CancelQuit
         );
     }
 
@@ -401,10 +457,10 @@ mod tests {
     fn global_keys_still_work_with_help_showing() {
         let mut app = default_app();
         app.show_help = true;
-        // 'q' is a global key and should still quit
+        // 'q' is a global key and should still request quit
         assert_eq!(
             handle_key_event(key(KeyCode::Char('q')), &app),
-            Action::Quit,
+            Action::RequestQuit,
         );
     }
 

@@ -3,6 +3,8 @@ use crate::app::ActiveView;
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
     Quit,
+    RequestQuit,
+    CancelQuit,
     SwitchTab(ActiveView),
     NextTab,
     PrevTab,

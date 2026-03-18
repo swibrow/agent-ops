@@ -77,6 +77,7 @@ pub struct App {
     // Overlays
     pub show_detail: bool,
     pub show_help: bool,
+    pub show_quit_confirm: bool,
     pub pane_preview: Option<String>,
 
     // Search
@@ -117,6 +118,7 @@ impl App {
             history_filter_project: None,
             show_detail: false,
             show_help: false,
+            show_quit_confirm: false,
             pane_preview: None,
             search_active: false,
             search_query: String::new(),
@@ -128,6 +130,8 @@ impl App {
     pub fn apply_action(&mut self, action: Action) {
         match action {
             Action::Quit => self.should_quit = true,
+            Action::RequestQuit => self.show_quit_confirm = true,
+            Action::CancelQuit => self.show_quit_confirm = false,
             Action::SwitchTab(view) => {
                 self.active_view = view;
                 self.show_detail = false;
