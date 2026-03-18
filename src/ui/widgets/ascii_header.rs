@@ -8,6 +8,8 @@ const HEADER: [&str; 3] = [
     r"╩ ╩ ╚═╝ ╚═╝ ╝╚╝  ╩    ╚═╝ ╩   ╚═╝",
 ];
 
+const SUBTITLE: &str = "─── monitor ∙ track ∙ resume ───────";
+
 /// Color gradient palette that shifts with tick
 const GRADIENT: [Color; 8] = [
     Color::Rgb(147, 51, 234), // purple
@@ -30,15 +32,12 @@ pub fn draw(
     let shift = (tick / 8) as usize;
     let width = area.width as usize;
 
-    // Build the tab bar line (bottom of header)
-    let tab_line = build_tab_line(active_view, pane_count, width);
-
-    // Layout: 3 lines of ASCII art + 1 line tab bar
+    // Layout: 3 lines ASCII art + 1 line subtitle with tabs
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // ASCII art
-            Constraint::Length(1), // Tab bar
+            Constraint::Length(1), // Subtitle + tabs
         ])
         .split(area);
 
@@ -65,44 +64,73 @@ pub fn draw(
     let art = ratatui::widgets::Paragraph::new(art_lines).alignment(Alignment::Center);
     frame.render_widget(art, layout[0]);
 
-    // Draw tab bar
-    let tab_paragraph = ratatui::widgets::Paragraph::new(tab_line);
-    frame.render_widget(tab_paragraph, layout[1]);
+    // Bottom line: tabs | subtitle (centered) | agent count
+    let tab_line = build_subtitle_line(active_view, pane_count, width, shift);
+    let paragraph = ratatui::widgets::Paragraph::new(tab_line);
+    frame.render_widget(paragraph, layout[1]);
 }
 
-fn build_tab_line<'a>(active_view: &ActiveView, pane_count: usize, width: usize) -> Line<'a> {
+fn build_subtitle_line<'a>(
+    active_view: &ActiveView,
+    pane_count: usize,
+    width: usize,
+    shift: usize,
+) -> Line<'a> {
     let tabs = [
         ("1", "Dashboard", ActiveView::Dashboard),
         ("2", "Projects", ActiveView::Projects),
         ("3", "History", ActiveView::History),
     ];
 
-    let mut spans: Vec<Span> = vec![Span::raw(" ")];
-
+    // Build left: tabs
+    let mut left_spans: Vec<Span> = vec![Span::raw(" ")];
     for (key, label, view) in &tabs {
         if active_view == view {
-            spans.push(Span::styled(
-                format!(" {key}:{label} "),
+            left_spans.push(Span::styled(
+                format!("{key}:{label}"),
                 Style::default().fg(Color::Cyan).bold(),
             ));
         } else {
-            spans.push(Span::styled(
-                format!(" {key}:{label} "),
+            left_spans.push(Span::styled(
+                format!("{key}:{label}"),
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        spans.push(Span::styled("│", Style::default().fg(Color::Rgb(50, 50, 65))));
+        left_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(50, 50, 65))));
     }
 
-    // Right-aligned agent count
-    let agent_text = format!(" {} active ", pane_count);
-    let left_len: usize = spans.iter().map(|s| s.content.len()).sum();
-    let pad = width.saturating_sub(left_len + agent_text.len());
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(
-        agent_text,
-        Style::default().fg(Color::Green).bold(),
-    ));
+    // Build center: subtitle with gradient
+    let subtitle_spans: Vec<Span> = SUBTITLE
+        .chars()
+        .enumerate()
+        .map(|(col_idx, ch)| {
+            let color_idx = (col_idx / 3 + shift + 3) % GRADIENT.len();
+            Span::styled(
+                ch.to_string(),
+                Style::default().fg(GRADIENT[color_idx]).bold(),
+            )
+        })
+        .collect();
+
+    // Build right: agent count
+    let agent_text = format!("{} active ", pane_count);
+    let right_span = Span::styled(agent_text.clone(), Style::default().fg(Color::Green).bold());
+
+    // Calculate padding
+    let left_len: usize = left_spans.iter().map(|s| s.content.len()).sum();
+    let center_len = SUBTITLE.len();
+    let right_len = agent_text.len();
+    let total = left_len + center_len + right_len;
+    let remaining = width.saturating_sub(total);
+    let pad_left = remaining / 2;
+    let pad_right = remaining.saturating_sub(pad_left);
+
+    // Assemble
+    let mut spans = left_spans;
+    spans.push(Span::raw(" ".repeat(pad_left)));
+    spans.extend(subtitle_spans);
+    spans.push(Span::raw(" ".repeat(pad_right)));
+    spans.push(right_span);
 
     Line::from(spans)
 }
