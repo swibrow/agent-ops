@@ -5,7 +5,7 @@ pub mod projects;
 pub mod widgets;
 
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Padding, Tabs};
+use ratatui::widgets::{Block, Borders, Clear, Padding};
 
 use crate::app::{ActiveView, App};
 
@@ -21,39 +21,41 @@ pub fn draw(frame: &mut Frame, app: &App) {
         return;
     }
 
-    // Main layout: header + tabs + content + footer
+    // Main layout: header (with tabs) + content + footer
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(5), // ASCII header
-            Constraint::Length(1), // Tab bar
+            Constraint::Length(4), // ASCII header + tab bar
             Constraint::Min(10),   // Content
             Constraint::Length(1), // Help footer / search bar / status
         ])
         .split(area);
 
-    // ASCII header
-    widgets::ascii_header::draw(frame, layout[0], app.tick_count);
-
-    // Tab bar
-    draw_tab_bar(frame, layout[1], &app.active_view, app.active_pane_count);
+    // ASCII header with integrated tab bar
+    widgets::ascii_header::draw(
+        frame,
+        layout[0],
+        app.tick_count,
+        &app.active_view,
+        app.active_pane_count,
+    );
 
     // Content
     match app.active_view {
-        ActiveView::Dashboard => dashboard::draw(frame, layout[2], app),
-        ActiveView::Projects => projects::draw(frame, layout[2], app),
-        ActiveView::History => history::draw(frame, layout[2], app),
+        ActiveView::Dashboard => dashboard::draw(frame, layout[1], app),
+        ActiveView::Projects => projects::draw(frame, layout[1], app),
+        ActiveView::History => history::draw(frame, layout[1], app),
     }
 
     // Footer: search bar, error, or help
     if app.search_active {
-        draw_search_bar(frame, layout[3], &app.search_query);
+        draw_search_bar(frame, layout[2], &app.search_query);
     } else if let Some(ref error) = app.last_error {
-        draw_error_bar(frame, layout[3], error);
+        draw_error_bar(frame, layout[2], error);
     } else if let Some(ref msg) = app.status_message {
-        draw_status_bar(frame, layout[3], msg);
+        draw_status_bar(frame, layout[2], msg);
     } else {
-        widgets::help_footer::draw(frame, layout[3], &app.active_view);
+        widgets::help_footer::draw(frame, layout[2], &app.active_view);
     }
 
     // Overlays
@@ -87,41 +89,6 @@ fn draw_too_small(frame: &mut Frame, area: Rect) {
         ])
         .split(area);
     frame.render_widget(paragraph, centered[1]);
-}
-
-fn draw_tab_bar(frame: &mut Frame, area: Rect, active: &ActiveView, pane_count: usize) {
-    let tab_titles = vec![
-        Line::from(" Dashboard "),
-        Line::from(" Projects "),
-        Line::from(" History "),
-    ];
-
-    let selected = match active {
-        ActiveView::Dashboard => 0,
-        ActiveView::Projects => 1,
-        ActiveView::History => 2,
-    };
-
-    let agent_count = format!(" {} active agents ", pane_count);
-
-    let tabs_layout = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Min(40),
-            Constraint::Length(agent_count.len() as u16 + 2),
-        ])
-        .split(area);
-
-    let tabs = Tabs::new(tab_titles)
-        .select(selected)
-        .style(Style::default().fg(Color::DarkGray))
-        .highlight_style(Style::default().fg(Color::Cyan).bold())
-        .divider("│");
-
-    frame.render_widget(tabs, tabs_layout[0]);
-
-    let count_span = Span::styled(agent_count, Style::default().fg(Color::Green).bold());
-    frame.render_widget(count_span, tabs_layout[1]);
 }
 
 fn draw_search_bar(frame: &mut Frame, area: Rect, query: &str) {
