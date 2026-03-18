@@ -37,10 +37,7 @@ impl NotificationTracker {
 
             if transitioned_to_permission {
                 debug!(session_id, "agent needs permission, sending notification");
-                send_macos_notification(
-                    "Agent needs attention",
-                    &format!("Session {} is waiting for permission", session_id),
-                );
+                send_notification(session_id);
                 sent += 1;
             }
         }
@@ -50,23 +47,16 @@ impl NotificationTracker {
     }
 }
 
-fn send_macos_notification(title: &str, message: &str) {
-    let script = format!(
-        "display notification \"{}\" with title \"{}\" sound name \"Funk\"",
-        message.replace('"', "\\\""),
-        title.replace('"', "\\\""),
-    );
-
-    match std::process::Command::new("osascript")
-        .args(["-e", &script])
-        .output()
+fn send_notification(session_id: &str) {
+    if let Err(e) = notify_rust::Notification::new()
+        .summary("Agent needs attention")
+        .body(&format!(
+            "Session {} is waiting for permission",
+            session_id
+        ))
+        .sound_name("Funk")
+        .show()
     {
-        Ok(output) if !output.status.success() => {
-            warn!("osascript notification failed: {:?}", output.status);
-        }
-        Err(e) => {
-            warn!(error = %e, "failed to send notification");
-        }
-        _ => {}
+        warn!(error = %e, "failed to send notification");
     }
 }
