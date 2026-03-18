@@ -10,8 +10,22 @@ pub struct TmuxPane {
 
 impl TmuxPane {
     pub fn is_claude_agent(&self) -> bool {
-        self.title.starts_with('\u{2733}') // ✳ prefix (idle)
-            || self.has_braille_prefix() // braille spinner (processing)
+        let has_claude_title =
+            self.title.starts_with('\u{2733}') // ✳ prefix (idle)
+            || self.has_braille_prefix(); // braille spinner (processing)
+
+        // A finished Claude session leaves the ✳ title on the pane even after
+        // the process exits. Filter these out by checking if the pane is just
+        // running a shell — if so, Claude has exited.
+        has_claude_title && !self.is_shell()
+    }
+
+    /// Returns true if the pane is running a bare shell (agent has exited).
+    fn is_shell(&self) -> bool {
+        matches!(
+            self.current_command.as_str(),
+            "zsh" | "bash" | "fish" | "sh" | "dash" | "ksh" | "tcsh" | "csh"
+        )
     }
 
     /// Check if pane title starts with a braille character (U+2800-U+28FF)
@@ -121,6 +135,31 @@ mod tests {
         // U+2900 is just above braille range
         let pane2 = make_pane("\u{2900} also not braille");
         assert!(!pane2.is_claude_agent());
+    }
+
+    #[test]
+    fn is_not_claude_agent_when_shell_took_over() {
+        // Claude exited but pane still has the ✳ title — current_command is now zsh
+        let pane = TmuxPane {
+            id: "%1".to_string(),
+            pid: 1234,
+            title: "\u{2733} Claude Code".to_string(),
+            current_command: "zsh".to_string(),
+            current_path: "/tmp".to_string(),
+        };
+        assert!(!pane.is_claude_agent());
+    }
+
+    #[test]
+    fn is_not_claude_agent_when_bash_took_over() {
+        let pane = TmuxPane {
+            id: "%1".to_string(),
+            pid: 1234,
+            title: "\u{2801} Processing".to_string(),
+            current_command: "bash".to_string(),
+            current_path: "/tmp".to_string(),
+        };
+        assert!(!pane.is_claude_agent());
     }
 
     // ── has_braille_prefix (tested via is_claude_agent) ──────────
