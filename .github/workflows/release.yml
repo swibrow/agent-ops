@@ -1,0 +1,170 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Set linker for aarch64-linux
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p .cargo
+          echo '[target.aarch64-unknown-linux-gnu]' >> .cargo/config.toml
+          echo 'linker = "aarch64-linux-gnu-gcc"' >> .cargo/config.toml
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Archive
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../agent-ops_${{ needs.release-please.outputs.version }}_${{ matrix.target }}.tar.gz agent-ops
+          cd ../../..
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-ops_${{ matrix.target }}
+          path: agent-ops_*.tar.gz
+
+  publish:
+    needs: [release-please, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: sha256sum agent-ops_*.tar.gz > checksums.txt
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ needs.release-please.outputs.tag_name }} \
+            agent-ops_*.tar.gz checksums.txt \
+            --repo ${{ github.repository }}
+
+  homebrew:
+    needs: [release-please, publish]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Update Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          VERSION=${{ needs.release-please.outputs.version }}
+          DARWIN_AMD64_SHA=$(sha256sum agent-ops_${VERSION}_x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
+          DARWIN_ARM64_SHA=$(sha256sum agent-ops_${VERSION}_aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
+          LINUX_AMD64_SHA=$(sha256sum agent-ops_${VERSION}_x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+          LINUX_ARM64_SHA=$(sha256sum agent-ops_${VERSION}_aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
+
+          FORMULA=$(cat <<EOFORMULA
+          class AgentOps < Formula
+            desc "TUI for monitoring and resuming Claude Code agent sessions in tmux"
+            homepage "https://github.com/swibrow/agent-ops"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_intel do
+                url "https://github.com/swibrow/agent-ops/releases/download/v${VERSION}/agent-ops_${VERSION}_x86_64-apple-darwin.tar.gz"
+                sha256 "${DARWIN_AMD64_SHA}"
+              end
+              on_arm do
+                url "https://github.com/swibrow/agent-ops/releases/download/v${VERSION}/agent-ops_${VERSION}_aarch64-apple-darwin.tar.gz"
+                sha256 "${DARWIN_ARM64_SHA}"
+              end
+            end
+
+            on_linux do
+              on_intel do
+                url "https://github.com/swibrow/agent-ops/releases/download/v${VERSION}/agent-ops_${VERSION}_x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_AMD64_SHA}"
+              end
+              on_arm do
+                url "https://github.com/swibrow/agent-ops/releases/download/v${VERSION}/agent-ops_${VERSION}_aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_ARM64_SHA}"
+              end
+            end
+
+            def install
+              bin.install "agent-ops"
+            end
+
+            test do
+              assert_match version.to_s, shell_output("#{bin}/agent-ops --version", 2)
+            end
+          end
+          EOFORMULA
+          )
+
+          # Clone homebrew-tap and update formula
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/swibrow/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          echo "$FORMULA" > tap/Formula/agent-ops.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/agent-ops.rb
+          git commit -m "agent-ops ${VERSION}"
+          git push
