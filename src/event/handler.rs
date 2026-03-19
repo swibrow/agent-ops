@@ -20,9 +20,7 @@ pub fn handle_key_event(key: KeyEvent, app: &App) -> Action {
     // Global keys first
     match key.code {
         KeyCode::Char('q') => return Action::RequestQuit,
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            return Action::Quit
-        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Action::Quit,
         KeyCode::Char('1') => return Action::SwitchTab(ActiveView::Dashboard),
         KeyCode::Char('2') => return Action::SwitchTab(ActiveView::Projects),
         KeyCode::Char('3') => return Action::SwitchTab(ActiveView::History),
@@ -286,10 +284,7 @@ mod tests {
     fn enter_confirms_quit() {
         let mut app = default_app();
         app.show_quit_confirm = true;
-        assert_eq!(
-            handle_key_event(key(KeyCode::Enter), &app),
-            Action::Quit
-        );
+        assert_eq!(handle_key_event(key(KeyCode::Enter), &app), Action::Quit);
     }
 
     #[test]

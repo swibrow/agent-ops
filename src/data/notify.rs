@@ -50,10 +50,7 @@ impl NotificationTracker {
 fn send_notification(session_id: &str) {
     if let Err(e) = notify_rust::Notification::new()
         .summary("Agent needs attention")
-        .body(&format!(
-            "Session {} is waiting for permission",
-            session_id
-        ))
+        .body(&format!("Session {} is waiting for permission", session_id))
         .sound_name("Funk")
         .show()
     {

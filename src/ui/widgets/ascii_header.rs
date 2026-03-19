@@ -22,13 +22,7 @@ const GRADIENT: [Color; 8] = [
     Color::Rgb(250, 204, 21), // yellow
 ];
 
-pub fn draw(
-    frame: &mut Frame,
-    area: Rect,
-    tick: u64,
-    active_view: &ActiveView,
-    pane_count: usize,
-) {
+pub fn draw(frame: &mut Frame, area: Rect, tick: u64, active_view: &ActiveView, pane_count: usize) {
     let shift = (tick / 8) as usize;
     let width = area.width as usize;
 
@@ -96,7 +90,10 @@ fn build_subtitle_line<'a>(
                 Style::default().fg(Color::DarkGray),
             ));
         }
-        left_spans.push(Span::styled(" │ ", Style::default().fg(Color::Rgb(50, 50, 65))));
+        left_spans.push(Span::styled(
+            " │ ",
+            Style::default().fg(Color::Rgb(50, 50, 65)),
+        ));
     }
 
     // Build center: subtitle with gradient

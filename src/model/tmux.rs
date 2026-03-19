@@ -10,8 +10,7 @@ pub struct TmuxPane {
 
 impl TmuxPane {
     pub fn is_claude_agent(&self) -> bool {
-        let has_claude_title =
-            self.title.starts_with('\u{2733}') // ✳ prefix (idle)
+        let has_claude_title = self.title.starts_with('\u{2733}') // ✳ prefix (idle)
             || self.has_braille_prefix(); // braille spinner (processing)
 
         // A finished Claude session leaves the ✳ title on the pane even after
