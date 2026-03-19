@@ -1,3 +1,4 @@
+mod agent;
 mod app;
 mod config;
 mod data;
@@ -8,6 +9,7 @@ mod tui;
 mod ui;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -16,6 +18,7 @@ use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
+use crate::agent::AgentRegistry;
 use crate::app::App;
 use crate::config::Config;
 use crate::data::notify::NotificationTracker;
@@ -26,7 +29,6 @@ use crate::event::handler::handle_key_event;
 
 /// Messages sent from background tasks to the UI
 enum SyncMsg {
-    /// Raw gathered data (needs DB write on main thread)
     Data(sync::GatheredData),
     Error(String),
 }
@@ -35,7 +37,6 @@ enum SyncMsg {
 async fn main() -> Result<()> {
     let config = Config::new()?;
 
-    // Ensure directories exist
     if let Some(parent) = config.db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -58,6 +59,9 @@ async fn main() -> Result<()> {
 
     info!("agent-ops starting");
 
+    // Agent registry
+    let registry = Arc::new(AgentRegistry::default_registry());
+
     // Open DB and run migrations
     let conn = Connection::open(&config.db_path)?;
     schema::run_migrations(&conn)?;
@@ -69,7 +73,7 @@ async fn main() -> Result<()> {
     }
 
     // Initial sync
-    let sync_result = sync::full_sync(&config, &conn).await?;
+    let sync_result = sync::full_sync(&config, &conn, &registry).await?;
 
     // Initialize app state
     let mut app = App::new();
@@ -79,15 +83,16 @@ async fn main() -> Result<()> {
     // Set up background sync channel
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<SyncMsg>();
 
-    // Spawn background sync task (only does async I/O, no DB)
+    // Spawn background sync task
     let sync_claude_dir = config.claude_dir.clone();
     let sync_poll_interval = Duration::from_secs(config.poll_interval_secs);
     let sync_tx_poll = sync_tx.clone();
+    let sync_registry = Arc::clone(&registry);
     tokio::spawn(async move {
         let cfg = Config {
             claude_dir: sync_claude_dir,
-            db_path: PathBuf::new(),  // not used for gather_data
-            log_path: PathBuf::new(), // not used for gather_data
+            db_path: PathBuf::new(),
+            log_path: PathBuf::new(),
             poll_interval_secs: 0,
             tick_rate_ms: 0,
             notifications_enabled: false,
@@ -96,7 +101,7 @@ async fn main() -> Result<()> {
         loop {
             tokio::time::sleep(sync_poll_interval).await;
 
-            match sync::gather_data(&cfg).await {
+            match sync::gather_data(&cfg, &sync_registry).await {
                 Ok(data) => {
                     let _ = sync_tx_poll.send(SyncMsg::Data(data));
                 }
@@ -107,13 +112,16 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn filesystem watcher for ~/.claude/sessions/
+    // Spawn filesystem watcher
     let watch_dir = config.claude_dir.join("sessions");
     let watch_tx = sync_tx.clone();
     if watch_dir.exists() {
         let watch_claude_dir = config.claude_dir.clone();
+        let watch_registry = Arc::clone(&registry);
         tokio::spawn(async move {
-            if let Err(e) = run_file_watcher(watch_dir, watch_tx, watch_claude_dir).await {
+            if let Err(e) =
+                run_file_watcher(watch_dir, watch_tx, watch_claude_dir, watch_registry).await
+            {
                 warn!(error = %e, "filesystem watcher failed");
             }
         });
@@ -125,19 +133,32 @@ async fn main() -> Result<()> {
     // Initialize terminal
     let mut terminal = tui::init()?;
 
-    // Main loop (UI + DB writes)
     let tick_rate = Duration::from_millis(config.tick_rate_ms);
 
     loop {
-        // Draw
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
-        // Check for sync results (non-blocking)
         while let Ok(msg) = sync_rx.try_recv() {
             match msg {
                 SyncMsg::Data(data) => match sync::apply_to_db(&conn, &data) {
                     Ok(result) => {
-                        notifier.check_transitions(&result.activity_map);
+                        let session_info: std::collections::HashMap<
+                            String,
+                            data::notify::SessionInfo,
+                        > = app
+                            .active_sessions
+                            .iter()
+                            .map(|s| {
+                                (
+                                    s.session_id.clone(),
+                                    data::notify::SessionInfo {
+                                        agent_type: s.agent_type,
+                                        project_name: s.project_name.clone(),
+                                    },
+                                )
+                            })
+                            .collect();
+                        notifier.check_transitions(&result.activity_map, &session_info);
                         app.apply_sync_result(&result);
                         app.refresh_from_db(&conn);
                     }
@@ -153,7 +174,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Handle events
         if crossterm::event::poll(tick_rate)? {
             if let Event::Key(key) = crossterm::event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -165,7 +185,6 @@ async fn main() -> Result<()> {
             app.apply_action(Action::Tick);
         }
 
-        // Load pane preview if detail view is open
         if app.show_detail && app.pane_preview.is_none() {
             if let Some(session) = app.selected_session() {
                 if let Some(ref pane) = session.tmux_pane {
@@ -188,11 +207,11 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Watch ~/.claude/sessions/ for changes and trigger data gathering
 async fn run_file_watcher(
     dir: PathBuf,
     tx: mpsc::UnboundedSender<SyncMsg>,
     claude_dir: PathBuf,
+    registry: Arc<AgentRegistry>,
 ) -> Result<()> {
     use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -227,14 +246,13 @@ async fn run_file_watcher(
             break;
         }
 
-        // Drain additional events
         while notify_rx.try_recv().is_ok() {}
 
         if last_sync.elapsed() < debounce {
             continue;
         }
 
-        match sync::gather_data(&cfg).await {
+        match sync::gather_data(&cfg, &registry).await {
             Ok(data) => {
                 let _ = tx.send(SyncMsg::Data(data));
             }

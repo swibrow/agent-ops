@@ -33,5 +33,7 @@ pub enum Action {
     CopySessionId,
     // Editor
     OpenInEditor,
+    // Agent filter
+    CycleAgentFilter,
     None,
 }

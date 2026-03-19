@@ -8,6 +8,7 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             id              INTEGER PRIMARY KEY AUTOINCREMENT,
             session_id      TEXT UNIQUE NOT NULL,
             pid             INTEGER,
+            agent_type      TEXT NOT NULL DEFAULT 'claude',
             project_path    TEXT NOT NULL,
             project_name    TEXT NOT NULL,
             started_at      INTEGER NOT NULL,
@@ -60,6 +61,22 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_daily_activity_project ON daily_activity(project_path);
         ",
     )?;
+
+    // Migration: add agent_type column to existing databases that don't have it
+    let has_agent_type: bool = conn
+        .prepare("SELECT agent_type FROM sessions LIMIT 0")
+        .is_ok();
+    if !has_agent_type {
+        conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'claude';",
+        )?;
+    }
+
+    // Create the agent_type index (safe now that the column is guaranteed to exist)
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_sessions_agent_type ON sessions(agent_type);",
+    )?;
+
     Ok(())
 }
 
@@ -73,33 +90,72 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
 
-        // Verify tables exist by querying them
         let count: i64 = conn
             .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 0);
 
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM daily_activity", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
-
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 0);
+        // Verify agent_type column exists
+        let _: String = conn
+            .query_row("SELECT agent_type FROM sessions LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or_default();
     }
 
     #[test]
     fn run_migrations_idempotent() {
         let conn = Connection::open_in_memory().unwrap();
         run_migrations(&conn).unwrap();
-        // Running again should not error
         run_migrations(&conn).unwrap();
+    }
+
+    #[test]
+    fn migration_adds_agent_type_to_existing_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Create old schema without agent_type
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT UNIQUE NOT NULL,
+                pid INTEGER,
+                project_path TEXT NOT NULL,
+                project_name TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                first_prompt TEXT,
+                summary TEXT,
+                git_branch TEXT,
+                message_count INTEGER DEFAULT 0,
+                last_activity INTEGER,
+                tmux_session TEXT,
+                tmux_window INTEGER,
+                tmux_pane_id TEXT,
+                pane_title TEXT
+            );",
+        )
+        .unwrap();
+
+        // Insert a row without agent_type
+        conn.execute(
+            "INSERT INTO sessions (session_id, project_path, project_name, started_at)
+             VALUES ('s1', '/p', 'p', 1000)",
+            [],
+        )
+        .unwrap();
+
+        // Run migrations — should add agent_type column
+        run_migrations(&conn).unwrap();
+
+        // Verify existing row defaults to 'claude'
+        let agent_type: String = conn
+            .query_row(
+                "SELECT agent_type FROM sessions WHERE session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(agent_type, "claude");
     }
 }

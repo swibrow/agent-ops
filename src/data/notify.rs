@@ -2,7 +2,13 @@ use std::collections::HashMap;
 
 use tracing::{debug, warn};
 
-use crate::model::session::AgentActivity;
+use crate::model::session::{AgentActivity, AgentType};
+
+/// Extra context about a session for richer notifications.
+pub struct SessionInfo {
+    pub agent_type: AgentType,
+    pub project_name: String,
+}
 
 /// Tracks previous activity states to detect transitions.
 /// When an agent transitions to WaitingForPermission, fires a macOS notification.
@@ -20,8 +26,13 @@ impl NotificationTracker {
     }
 
     /// Check for activity transitions and send notifications.
+    /// `session_info` maps session_id -> (agent_type, project_name) for richer messages.
     /// Returns the count of notifications sent.
-    pub fn check_transitions(&mut self, current: &HashMap<String, AgentActivity>) -> usize {
+    pub fn check_transitions(
+        &mut self,
+        current: &HashMap<String, AgentActivity>,
+        session_info: &HashMap<String, SessionInfo>,
+    ) -> usize {
         if !self.enabled {
             self.previous_activities = current.clone();
             return 0;
@@ -37,7 +48,8 @@ impl NotificationTracker {
 
             if transitioned_to_permission {
                 debug!(session_id, "agent needs permission, sending notification");
-                send_notification(session_id);
+                let info = session_info.get(session_id);
+                send_notification(session_id, info);
                 sent += 1;
             }
         }
@@ -47,10 +59,25 @@ impl NotificationTracker {
     }
 }
 
-fn send_notification(session_id: &str) {
+fn send_notification(session_id: &str, info: Option<&SessionInfo>) {
+    let (summary, body) = match info {
+        Some(info) => (
+            format!("{} needs attention", info.agent_type.label()),
+            format!(
+                "{} agent in \"{}\" is waiting for permission",
+                info.agent_type.label(),
+                info.project_name,
+            ),
+        ),
+        None => (
+            "Agent needs attention".to_string(),
+            format!("Session {} is waiting for permission", session_id),
+        ),
+    };
+
     if let Err(e) = notify_rust::Notification::new()
-        .summary("Agent needs attention")
-        .body(&format!("Session {} is waiting for permission", session_id))
+        .summary(&summary)
+        .body(&body)
         .sound_name("Funk")
         .show()
     {
