@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.0](https://github.com/swibrow/agent-ops/compare/v0.2.0...v0.3.0) (2026-03-20)
+
+
+### Features
+
+* multi-agent support (Claude, Codex, OpenCode, Gemini, Aider) ([16ff15a](https://github.com/swibrow/agent-ops/commit/16ff15ac69af40cdfd7d08a3cc1295ed9e174020))
+* multi-agent support with trait-based provider system ([8ee6250](https://github.com/swibrow/agent-ops/commit/8ee62503763c026a6bf66df18b965687741ed8f8))
+
 ## [0.2.0](https://github.com/swibrow/agent-ops/compare/v0.1.0...v0.2.0) (2026-03-19)
 
 
