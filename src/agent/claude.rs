@@ -100,13 +100,28 @@ impl AgentProvider for ClaudeProvider {
                 }
             };
 
-            let last_lines: Vec<&str> = content.lines().rev().take(15).collect();
+            let last_lines: Vec<&str> = content.lines().rev().take(30).collect();
             let has_permission = last_lines.iter().any(|line| {
-                line.contains("Do you want to proceed?")
-                    || line.contains("Yes, and don't ask again")
-                    || line.contains("Esc to cancel")
-                    || line.contains("Run shell command")
-                    || line.contains("approve this action")
+                let trimmed = line.trim();
+                // Explicit permission prompts
+                trimmed.contains("Do you want to proceed?")
+                    || trimmed.contains("Yes, and don't ask again")
+                    || trimmed.contains("Esc to cancel")
+                    || trimmed.contains("approve this action")
+                    // Selection menu options (numbered Yes/No choices)
+                    || trimmed == "1. Yes"
+                    || trimmed == "2. No"
+                    || trimmed.contains("1. Yes")
+                        && trimmed.contains('\u{276F}') // ❯ selection indicator
+                    // Tool approval headers
+                    || trimmed.starts_with("Bash command")
+                    || trimmed.starts_with("Edit file")
+                    || trimmed.starts_with("Write file")
+                    || trimmed.starts_with("Create file")
+                    || trimmed.starts_with("Run command")
+                    // Safety warnings that precede permission prompts
+                    || trimmed.contains("Command contains")
+                    || trimmed.contains("Shell operators detected")
             });
 
             if has_permission {

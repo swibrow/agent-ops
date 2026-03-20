@@ -246,6 +246,13 @@ fn build_session(
     matched: Option<&AgentSessionFile>,
     activity: &AgentActivity,
 ) -> AgentSession {
+    // Only update last_activity when the agent is actively doing work.
+    // For idle/waiting states, pass None so the DB preserves the previous value.
+    let last_activity = match activity {
+        AgentActivity::Processing => Some(chrono::Utc::now().timestamp_millis()),
+        _ => None,
+    };
+
     match matched {
         Some(sf) => AgentSession {
             session_id: sf.session_id.clone(),
@@ -260,7 +267,7 @@ fn build_session(
             summary: None,
             git_branch: None,
             message_count: 0,
-            last_activity: Some(chrono::Utc::now().timestamp_millis()),
+            last_activity,
             tmux_pane: Some(pane.tmux_ref.clone()),
             pane_title: Some(pane.title.clone()),
             activity: activity.clone(),
@@ -280,7 +287,7 @@ fn build_session(
             summary: None,
             git_branch: None,
             message_count: 0,
-            last_activity: Some(chrono::Utc::now().timestamp_millis()),
+            last_activity,
             tmux_pane: Some(pane.tmux_ref.clone()),
             pane_title: Some(pane.title.clone()),
             activity: activity.clone(),

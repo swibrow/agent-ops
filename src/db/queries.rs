@@ -26,10 +26,7 @@ pub fn upsert_session(conn: &Connection, session: &AgentSession) -> Result<()> {
             summary = COALESCE(excluded.summary, sessions.summary),
             git_branch = COALESCE(excluded.git_branch, sessions.git_branch),
             message_count = MAX(excluded.message_count, sessions.message_count),
-            last_activity = CASE
-                WHEN excluded.status = 'active' THEN excluded.last_activity
-                ELSE COALESCE(sessions.last_activity, excluded.last_activity)
-            END,
+            last_activity = COALESCE(excluded.last_activity, sessions.last_activity),
             tmux_session = COALESCE(excluded.tmux_session, sessions.tmux_session),
             tmux_window = COALESCE(excluded.tmux_window, sessions.tmux_window),
             tmux_pane_id = COALESCE(excluded.tmux_pane_id, sessions.tmux_pane_id),

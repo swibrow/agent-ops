@@ -8,6 +8,7 @@ mod model;
 mod tui;
 mod ui;
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,6 +131,9 @@ async fn main() -> Result<()> {
     // Notification tracker
     let mut notifier = NotificationTracker::new(config.notifications_enabled);
 
+    // Track which tmux windows we've renamed so we can reset them on shutdown
+    let mut renamed_windows: HashSet<String> = HashSet::new();
+
     // Initialize terminal
     let mut terminal = tui::init()?;
 
@@ -142,10 +146,7 @@ async fn main() -> Result<()> {
             match msg {
                 SyncMsg::Data(data) => match sync::apply_to_db(&conn, &data) {
                     Ok(result) => {
-                        let session_info: std::collections::HashMap<
-                            String,
-                            data::notify::SessionInfo,
-                        > = app
+                        let session_info: HashMap<String, data::notify::SessionInfo> = app
                             .active_sessions
                             .iter()
                             .map(|s| {
@@ -159,6 +160,46 @@ async fn main() -> Result<()> {
                             })
                             .collect();
                         notifier.check_transitions(&result.activity_map, &session_info);
+
+                        // Build per-window activity states from gathered pane data.
+                        // Multiple panes can share a window — pick the highest priority.
+                        let mut window_activities: HashMap<String, model::session::AgentActivity> =
+                            HashMap::new();
+                        for pane in &data.agent_panes {
+                            let target = format!(
+                                "{}:{}",
+                                pane.tmux_ref.session_name, pane.tmux_ref.window_index
+                            );
+                            let activity = data
+                                .pane_activities
+                                .get(&pane.tmux_ref.pane_id)
+                                .cloned()
+                                .unwrap_or(pane.title_activity.clone());
+                            let entry = window_activities.entry(target).or_default();
+                            if activity.sort_priority() < entry.sort_priority() {
+                                *entry = activity;
+                            }
+                        }
+
+                        let window_states: Vec<data::tmux::AgentWindowState> = window_activities
+                            .into_iter()
+                            .map(|(target, activity)| data::tmux::AgentWindowState {
+                                target,
+                                activity,
+                            })
+                            .collect();
+
+                        // Remember which windows we've touched
+                        for ws in &window_states {
+                            renamed_windows.insert(ws.target.clone());
+                        }
+
+                        if let Err(e) =
+                            data::tmux::update_agent_window_titles(&window_states).await
+                        {
+                            warn!(error = %e, "failed to update tmux window titles");
+                        }
+
                         app.apply_sync_result(&result);
                         app.refresh_from_db(&conn);
                     }
@@ -202,6 +243,13 @@ async fn main() -> Result<()> {
     }
 
     tui::restore()?;
+
+    // Reset all agent tmux windows back to automatic naming
+    let targets: Vec<String> = renamed_windows.into_iter().collect();
+    if let Err(e) = data::tmux::reset_agent_window_titles(&targets).await {
+        warn!(error = %e, "failed to reset tmux window titles on shutdown");
+    }
+
     info!("agent-ops shutdown");
 
     Ok(())
