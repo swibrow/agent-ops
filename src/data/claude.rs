@@ -34,6 +34,7 @@ pub struct SessionIndexEntry {
 }
 
 /// Read all active session files from ~/.claude/sessions/
+#[allow(dead_code)]
 pub fn read_active_sessions(claude_dir: &Path) -> Result<Vec<ClaudeSessionFile>> {
     let sessions_dir = claude_dir.join("sessions");
     if !sessions_dir.exists() {

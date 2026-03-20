@@ -65,6 +65,7 @@ pub fn handle_key_event(key: KeyEvent, app: &App) -> Action {
             _ => Action::None,
         },
         KeyCode::Char('F') => Action::ClearFilter,
+        KeyCode::Char('a') => Action::CycleAgentFilter,
         KeyCode::Char('e') => match app.active_view {
             ActiveView::Projects => Action::OpenInEditor,
             _ => Action::None,

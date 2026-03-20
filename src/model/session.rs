@@ -1,4 +1,86 @@
+use ratatui::style::Color;
+
 use crate::model::tmux::TmuxPaneRef;
+
+/// Which CLI agent is running in this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum AgentType {
+    Claude,
+    Codex,
+    OpenCode,
+    Gemini,
+    Aider,
+    #[default]
+    Unknown,
+}
+
+impl AgentType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::OpenCode => "opencode",
+            Self::Gemini => "gemini",
+            Self::Aider => "aider",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "claude" => Self::Claude,
+            "codex" => Self::Codex,
+            "opencode" => Self::OpenCode,
+            "gemini" => Self::Gemini,
+            "aider" => Self::Aider,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Claude => "Claude",
+            Self::Codex => "Codex",
+            Self::OpenCode => "OpenCode",
+            Self::Gemini => "Gemini",
+            Self::Aider => "Aider",
+            Self::Unknown => "Agent",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self {
+            Self::Claude => "✳",
+            Self::Codex => "⚙",
+            Self::OpenCode => "▶",
+            Self::Gemini => "◆",
+            Self::Aider => "⚡",
+            Self::Unknown => "●",
+        }
+    }
+
+    pub fn color(&self) -> Color {
+        match self {
+            Self::Claude => Color::Rgb(204, 120, 50), // orange/amber (Claude brand)
+            Self::Codex => Color::Rgb(16, 163, 127),  // green (OpenAI)
+            Self::OpenCode => Color::Rgb(59, 130, 246), // blue
+            Self::Gemini => Color::Rgb(66, 133, 244), // Google blue
+            Self::Aider => Color::Rgb(168, 85, 247),  // purple
+            Self::Unknown => Color::DarkGray,
+        }
+    }
+
+    /// All known agent types for cycling through filters.
+    pub fn all() -> &'static [AgentType] {
+        &[
+            Self::Claude,
+            Self::Codex,
+            Self::OpenCode,
+            Self::Gemini,
+            Self::Aider,
+        ]
+    }
+}
 
 /// What the agent is actively doing right now
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -62,6 +144,7 @@ impl SessionStatus {
 pub struct AgentSession {
     pub session_id: String,
     pub pid: Option<u32>,
+    pub agent_type: AgentType,
     pub project_path: String,
     pub project_name: String,
     pub started_at: i64,

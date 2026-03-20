@@ -59,6 +59,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
             ),
         ]),
         Line::from(vec![
+            Span::styled("  Agent:    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                session.agent_type.label(),
+                Style::default().fg(session.agent_type.color()).bold(),
+            ),
+        ]),
+        Line::from(vec![
             Span::styled("  Branch:   ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 session.git_branch.as_deref().unwrap_or("N/A"),

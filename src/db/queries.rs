@@ -3,15 +3,16 @@ use rusqlite::{params, Connection};
 
 use crate::model::history::HistoryEntry;
 use crate::model::project::{Project, StalenessLevel};
-use crate::model::session::{AgentActivity, AgentSession, SessionStatus};
+use crate::model::session::{AgentActivity, AgentSession, AgentType, SessionStatus};
 use crate::model::tmux::TmuxPaneRef;
 
 pub fn upsert_session(conn: &Connection, session: &AgentSession) -> Result<()> {
     conn.execute(
-        "INSERT INTO sessions (session_id, pid, project_path, project_name, started_at, ended_at, status, first_prompt, summary, git_branch, message_count, last_activity, tmux_session, tmux_window, tmux_pane_id, pane_title)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+        "INSERT INTO sessions (session_id, pid, agent_type, project_path, project_name, started_at, ended_at, status, first_prompt, summary, git_branch, message_count, last_activity, tmux_session, tmux_window, tmux_pane_id, pane_title)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          ON CONFLICT(session_id) DO UPDATE SET
             pid = COALESCE(excluded.pid, sessions.pid),
+            agent_type = excluded.agent_type,
             status = CASE
                 WHEN excluded.status = 'active' THEN 'active'
                 WHEN sessions.status = 'active' THEN sessions.status
@@ -36,6 +37,7 @@ pub fn upsert_session(conn: &Connection, session: &AgentSession) -> Result<()> {
         params![
             session.session_id,
             session.pid,
+            session.agent_type.as_str(),
             session.project_path,
             session.project_name,
             session.started_at,
@@ -91,95 +93,66 @@ pub fn insert_history(conn: &Connection, entry: &HistoryEntry) -> Result<()> {
     Ok(())
 }
 
+const SESSION_COLUMNS: &str = "session_id, pid, agent_type, project_path, project_name, started_at, ended_at, status, first_prompt, summary, git_branch, message_count, last_activity, tmux_session, tmux_window, tmux_pane_id, pane_title";
+
+fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSession> {
+    let tmux_session: Option<String> = row.get(13)?;
+    let tmux_window: Option<u32> = row.get(14)?;
+    let tmux_pane_id: Option<String> = row.get(15)?;
+
+    let tmux_pane = match (tmux_session, tmux_window, tmux_pane_id) {
+        (Some(s), Some(w), Some(p)) => Some(TmuxPaneRef {
+            session_name: s,
+            window_index: w,
+            pane_id: p,
+        }),
+        _ => None,
+    };
+
+    Ok(AgentSession {
+        session_id: row.get(0)?,
+        pid: row.get(1)?,
+        agent_type: AgentType::from_str(
+            row.get::<_, String>(2)
+                .unwrap_or_else(|_| "claude".to_string())
+                .as_str(),
+        ),
+        project_path: row.get(3)?,
+        project_name: row.get(4)?,
+        started_at: row.get(5)?,
+        ended_at: row.get(6)?,
+        status: SessionStatus::from_str(row.get::<_, String>(7)?.as_str()),
+        first_prompt: row.get(8)?,
+        summary: row.get(9)?,
+        git_branch: row.get(10)?,
+        message_count: row.get(11)?,
+        last_activity: row.get(12)?,
+        tmux_pane,
+        pane_title: row.get(16)?,
+        activity: AgentActivity::Unknown,
+        cpu_percent: 0.0,
+        memory_mb: 0.0,
+    })
+}
+
 pub fn get_all_sessions(conn: &Connection) -> Result<Vec<AgentSession>> {
-    let mut stmt = conn.prepare(
-        "SELECT session_id, pid, project_path, project_name, started_at, ended_at, status, first_prompt, summary, git_branch, message_count, last_activity, tmux_session, tmux_window, tmux_pane_id, pane_title
-         FROM sessions ORDER BY last_activity DESC NULLS LAST"
-    )?;
-
+    let sql =
+        format!("SELECT {SESSION_COLUMNS} FROM sessions ORDER BY last_activity DESC NULLS LAST");
+    let mut stmt = conn.prepare(&sql)?;
     let sessions = stmt
-        .query_map([], |row| {
-            let tmux_session: Option<String> = row.get(12)?;
-            let tmux_window: Option<u32> = row.get(13)?;
-            let tmux_pane_id: Option<String> = row.get(14)?;
-
-            let tmux_pane = match (tmux_session, tmux_window, tmux_pane_id) {
-                (Some(s), Some(w), Some(p)) => Some(TmuxPaneRef {
-                    session_name: s,
-                    window_index: w,
-                    pane_id: p,
-                }),
-                _ => None,
-            };
-
-            Ok(AgentSession {
-                session_id: row.get(0)?,
-                pid: row.get(1)?,
-                project_path: row.get(2)?,
-                project_name: row.get(3)?,
-                started_at: row.get(4)?,
-                ended_at: row.get(5)?,
-                status: SessionStatus::from_str(row.get::<_, String>(6)?.as_str()),
-                first_prompt: row.get(7)?,
-                summary: row.get(8)?,
-                git_branch: row.get(9)?,
-                message_count: row.get(10)?,
-                last_activity: row.get(11)?,
-                tmux_pane,
-                pane_title: row.get(15)?,
-                activity: AgentActivity::Unknown,
-                cpu_percent: 0.0,
-                memory_mb: 0.0,
-            })
-        })?
+        .query_map([], map_session_row)?
         .collect::<Result<Vec<_>, _>>()?;
-
     Ok(sessions)
 }
 
 pub fn get_active_sessions(conn: &Connection) -> Result<Vec<AgentSession>> {
-    let mut stmt = conn.prepare(
-        "SELECT session_id, pid, project_path, project_name, started_at, ended_at, status, first_prompt, summary, git_branch, message_count, last_activity, tmux_session, tmux_window, tmux_pane_id, pane_title
-         FROM sessions WHERE status IN ('active', 'idle') ORDER BY last_activity DESC"
-    )?;
-
+    let sql = format!(
+        "SELECT {SESSION_COLUMNS} FROM sessions WHERE status IN ('active', 'idle') ORDER BY last_activity DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let sessions = stmt
-        .query_map([], |row| {
-            let tmux_session: Option<String> = row.get(12)?;
-            let tmux_window: Option<u32> = row.get(13)?;
-            let tmux_pane_id: Option<String> = row.get(14)?;
-
-            let tmux_pane = match (tmux_session, tmux_window, tmux_pane_id) {
-                (Some(s), Some(w), Some(p)) => Some(TmuxPaneRef {
-                    session_name: s,
-                    window_index: w,
-                    pane_id: p,
-                }),
-                _ => None,
-            };
-
-            Ok(AgentSession {
-                session_id: row.get(0)?,
-                pid: row.get(1)?,
-                project_path: row.get(2)?,
-                project_name: row.get(3)?,
-                started_at: row.get(4)?,
-                ended_at: row.get(5)?,
-                status: SessionStatus::from_str(row.get::<_, String>(6)?.as_str()),
-                first_prompt: row.get(7)?,
-                summary: row.get(8)?,
-                git_branch: row.get(9)?,
-                message_count: row.get(10)?,
-                last_activity: row.get(11)?,
-                tmux_pane,
-                pane_title: row.get(15)?,
-                activity: AgentActivity::Unknown,
-                cpu_percent: 0.0,
-                memory_mb: 0.0,
-            })
-        })?
+        .query_map([], map_session_row)?
         .collect::<Result<Vec<_>, _>>()?;
-
     Ok(sessions)
 }
 
@@ -327,6 +300,7 @@ mod tests {
         AgentSession {
             session_id: id.to_string(),
             pid: Some(1234),
+            agent_type: AgentType::Claude,
             project_path: project_path.to_string(),
             project_name: project_path
                 .rsplit('/')

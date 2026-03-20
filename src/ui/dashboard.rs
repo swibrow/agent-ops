@@ -90,17 +90,37 @@ fn draw_sparkline_bar(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_session_list(frame: &mut Frame, area: Rect, app: &App) {
+    let title = match &app.agent_filter {
+        Some(agent_type) => format!(" LIVE SESSIONS [{}] ", agent_type.label()),
+        None => " LIVE SESSIONS ".to_string(),
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(" LIVE SESSIONS ")
+        .title(title)
         .title_style(Style::default().fg(Color::Cyan).bold())
         .padding(Padding::new(1, 1, 0, 0));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let sessions = &app.active_sessions;
+    // Apply agent filter
+    let filtered: Vec<&crate::model::session::AgentSession>;
+    let sessions: &[&crate::model::session::AgentSession] = match &app.agent_filter {
+        Some(filter_type) => {
+            filtered = app
+                .active_sessions
+                .iter()
+                .filter(|s| &s.agent_type == filter_type)
+                .collect();
+            &filtered
+        }
+        None => {
+            filtered = app.active_sessions.iter().collect();
+            &filtered
+        }
+    };
 
     if sessions.is_empty() {
         let empty = Paragraph::new(vec![
@@ -137,6 +157,7 @@ fn draw_session_list(frame: &mut Frame, area: Rect, app: &App) {
     {
         let is_selected = i == selected;
 
+        let agent_icon = status_badge::agent_type_span(&session.agent_type);
         let activity_icon = status_badge::activity_span(&session.activity, app.tick_count);
         let name_style = if is_selected {
             Style::default().fg(Color::White).bold()
@@ -162,7 +183,8 @@ fn draw_session_list(frame: &mut Frame, area: Rect, app: &App) {
 
         let right_stats = format!("{:5.1}%  {:.0}MB", session.cpu_percent, session.memory_mb);
         let left_prefix = if is_selected { "▸ " } else { "  " };
-        let left_content_len = 2 + 2 + session.project_name.len() + 2 + title.len();
+        // 2 (prefix) + 2 (agent icon + space) + 2 (activity icon + space) + project_name + 2 (gap) + title
+        let left_content_len = 2 + 2 + 2 + session.project_name.len() + 2 + title.len();
         let gap = if full_width > left_content_len + right_stats.len() + 2 {
             full_width - left_content_len - right_stats.len() - 2
         } else {
@@ -171,6 +193,7 @@ fn draw_session_list(frame: &mut Frame, area: Rect, app: &App) {
 
         let line1 = Line::from(vec![
             Span::raw(left_prefix),
+            agent_icon,
             activity_icon,
             Span::styled(&session.project_name, name_style),
             Span::styled("  ", Style::default()),

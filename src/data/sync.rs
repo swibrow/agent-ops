@@ -4,11 +4,13 @@ use anyhow::Result;
 use rusqlite::Connection;
 use tracing::{debug, info, warn};
 
+use crate::agent::{AgentRegistry, AgentSessionFile};
 use crate::config::Config;
 use crate::data::{claude, stats, tmux};
 use crate::db::queries;
 use crate::model::project::{Project, StalenessLevel};
-use crate::model::session::{AgentActivity, AgentSession, SessionStatus};
+use crate::model::session::{AgentActivity, AgentSession, AgentType, SessionStatus};
+use crate::model::tmux::TmuxPaneRef;
 
 /// Maps session_id -> activity for overlaying onto DB results
 pub type ActivityMap = HashMap<String, AgentActivity>;
@@ -17,22 +19,39 @@ pub type ActivityMap = HashMap<String, AgentActivity>;
 /// This struct is Send and can be passed across threads.
 pub struct GatheredData {
     pub agent_panes: Vec<tmux::AgentPaneInfo>,
-    pub claude_sessions: Vec<claude::ClaudeSessionFile>,
+    pub session_files: Vec<AgentSessionFile>,
     pub project_sessions: Vec<(String, Vec<claude::SessionIndexEntry>)>,
     pub process_tree: stats::ProcessTree,
-    /// Activity refined by pane content sniffing
     pub pane_activities: HashMap<String, AgentActivity>,
 }
 
 /// Gather all data from async sources (tmux, filesystem, ps).
-/// This is Send-safe — no DB references held across awaits.
-pub async fn gather_data(config: &Config) -> Result<GatheredData> {
-    // Step 1: Find all Claude agent panes (single tmux call)
-    let agent_panes = tmux::find_agent_panes().await?;
-    debug!(pane_count = agent_panes.len(), "found agent panes");
+/// Uses the registry to detect agents across all providers.
+pub async fn gather_data(config: &Config, registry: &AgentRegistry) -> Result<GatheredData> {
+    // Step 1: List all tmux panes (single call)
+    let all_panes = tmux::list_all_panes().await?;
 
-    // Step 2: Read Claude session files (sync I/O but fast)
-    let claude_sessions = claude::read_active_sessions(&config.claude_dir).unwrap_or_default();
+    // Step 2: Detect agents using the registry
+    let mut agent_panes = Vec::new();
+    for (session_name, window_index, pane) in &all_panes {
+        if let Some(provider) = registry.detect(pane) {
+            let activity = provider.detect_activity(pane);
+            let title = provider.clean_title(&pane.title).to_string();
+            agent_panes.push(tmux::AgentPaneInfo {
+                tmux_ref: TmuxPaneRef {
+                    session_name: session_name.clone(),
+                    window_index: *window_index,
+                    pane_id: pane.id.clone(),
+                },
+                pid: pane.pid,
+                title,
+                current_path: pane.current_path.clone(),
+                agent_type: provider.agent_type(),
+                title_activity: activity,
+            });
+        }
+    }
+    debug!(pane_count = agent_panes.len(), "found agent panes");
 
     // Step 3: Build process tree (single ps call)
     let process_tree = stats::ProcessTree::snapshot().await.unwrap_or_else(|e| {
@@ -40,21 +59,45 @@ pub async fn gather_data(config: &Config) -> Result<GatheredData> {
         stats::ProcessTree::empty()
     });
 
-    // Step 4: Detect activity for each pane (may capture pane content)
-    let mut pane_activities = HashMap::new();
-    for pane in &agent_panes {
-        let activity =
-            tmux::detect_activity_from_content(&pane.tmux_ref.pane_id, pane.title_activity.clone())
-                .await;
-        pane_activities.insert(pane.tmux_ref.pane_id.clone(), activity);
+    // Step 4: Gather session files from all providers
+    let mut session_files = Vec::new();
+    for provider in registry.providers() {
+        match provider.gather_sessions(config).await {
+            Ok(sessions) => session_files.extend(sessions),
+            Err(e) => {
+                warn!(
+                    agent = provider.agent_type().as_str(),
+                    error = %e,
+                    "failed to gather sessions"
+                );
+            }
+        }
     }
 
-    // Step 5: Read project session indexes
+    // Step 5: Refine activity for each pane (provider-specific I/O)
+    let mut pane_activities = HashMap::new();
+    for pane in &agent_panes {
+        // Find the provider for this pane's agent type
+        let refined = if let Some(provider) = registry
+            .providers()
+            .iter()
+            .find(|p| p.agent_type() == pane.agent_type)
+        {
+            provider
+                .refine_activity(&pane.tmux_ref.pane_id, pane.title_activity.clone())
+                .await
+        } else {
+            pane.title_activity.clone()
+        };
+        pane_activities.insert(pane.tmux_ref.pane_id.clone(), refined);
+    }
+
+    // Step 6: Read project session indexes (Claude-specific, but still useful for history)
     let project_sessions = claude::read_project_sessions(&config.claude_dir).unwrap_or_default();
 
     Ok(GatheredData {
         agent_panes,
-        claude_sessions,
+        session_files,
         project_sessions,
         process_tree,
         pane_activities,
@@ -62,22 +105,21 @@ pub async fn gather_data(config: &Config) -> Result<GatheredData> {
 }
 
 /// Apply gathered data to the database (sync, requires Connection).
-/// Call this on the main thread after receiving GatheredData.
 pub fn apply_to_db(conn: &Connection, data: &GatheredData) -> Result<SyncResult> {
     let mut result = SyncResult {
         active_pane_count: data.agent_panes.len(),
         ..Default::default()
     };
 
-    // Build PID -> claude session map
-    let mut pid_to_claude: HashMap<u32, &claude::ClaudeSessionFile> = HashMap::new();
-    for cs in &data.claude_sessions {
-        if let Some(pid) = cs.pid {
-            pid_to_claude.insert(pid, cs);
+    // Build PID -> session file map
+    let mut pid_to_session: HashMap<u32, &AgentSessionFile> = HashMap::new();
+    for sf in &data.session_files {
+        if let Some(pid) = sf.pid {
+            pid_to_session.insert(pid, sf);
         }
     }
 
-    // Match agent panes to claude sessions and upsert
+    // Match agent panes to session files and upsert
     let active_pane_ids: Vec<String> = data
         .agent_panes
         .iter()
@@ -93,53 +135,14 @@ pub fn apply_to_db(conn: &Connection, data: &GatheredData) -> Result<SyncResult>
             .cloned()
             .unwrap_or(pane.title_activity.clone());
 
-        let claude_session = find_claude_session_for_pane(
+        let matched_session = find_session_for_pane(
             pane,
-            &pid_to_claude,
+            &pid_to_session,
             &claimed_session_ids,
             &data.process_tree,
         );
 
-        let session = match claude_session {
-            Some(cs) => AgentSession {
-                session_id: cs.session_id.clone(),
-                pid: cs.pid,
-                project_path: cs.cwd.clone(),
-                project_name: claude::project_name_from_path(&cs.cwd),
-                started_at: cs.started_at,
-                ended_at: None,
-                status: SessionStatus::Active,
-                first_prompt: None,
-                summary: None,
-                git_branch: None,
-                message_count: 0,
-                last_activity: Some(chrono::Utc::now().timestamp_millis()),
-                tmux_pane: Some(pane.tmux_ref.clone()),
-                pane_title: Some(pane.title.clone()),
-                activity: activity.clone(),
-                cpu_percent: 0.0,
-                memory_mb: 0.0,
-            },
-            None => AgentSession {
-                session_id: format!("tmux-{}", pane.tmux_ref.pane_id),
-                pid: Some(pane.pid),
-                project_path: pane.current_path.clone(),
-                project_name: claude::project_name_from_path(&pane.current_path),
-                started_at: chrono::Utc::now().timestamp_millis(),
-                ended_at: None,
-                status: SessionStatus::Active,
-                first_prompt: None,
-                summary: None,
-                git_branch: None,
-                message_count: 0,
-                last_activity: Some(chrono::Utc::now().timestamp_millis()),
-                tmux_pane: Some(pane.tmux_ref.clone()),
-                pane_title: Some(pane.title.clone()),
-                activity: activity.clone(),
-                cpu_percent: 0.0,
-                memory_mb: 0.0,
-            },
-        };
+        let session = build_session(pane, matched_session, &activity);
 
         claimed_session_ids.push(session.session_id.clone());
         pane_pid_to_session_id.insert(pane.pid, session.session_id.clone());
@@ -155,12 +158,13 @@ pub fn apply_to_db(conn: &Connection, data: &GatheredData) -> Result<SyncResult>
     let marked = queries::mark_sessions_completed(conn, &active_pane_ids)?;
     result.sessions_completed = marked;
 
-    // Import project session history
+    // Import project session history (Claude-specific)
     for (project_path, entries) in &data.project_sessions {
         for entry in entries {
             let session = AgentSession {
                 session_id: entry.session_id.clone(),
                 pid: None,
+                agent_type: AgentType::Claude,
                 project_path: project_path.clone(),
                 project_name: claude::project_name_from_path(project_path),
                 started_at: entry.created.unwrap_or(0),
@@ -184,7 +188,7 @@ pub fn apply_to_db(conn: &Connection, data: &GatheredData) -> Result<SyncResult>
     // Update project aggregates
     sync_project_aggregates(conn)?;
 
-    // Collect CPU/RAM stats using the process tree
+    // Collect CPU/RAM stats
     let mut all_pids: Vec<u32> = data.agent_panes.iter().map(|p| p.pid).collect();
     let self_pid = std::process::id();
     all_pids.push(self_pid);
@@ -209,9 +213,13 @@ pub fn apply_to_db(conn: &Connection, data: &GatheredData) -> Result<SyncResult>
     Ok(result)
 }
 
-/// Full sync: gather data + apply to DB. Convenience for initial sync on main thread.
-pub async fn full_sync(config: &Config, conn: &Connection) -> Result<SyncResult> {
-    let data = gather_data(config).await?;
+/// Full sync: gather data + apply to DB.
+pub async fn full_sync(
+    config: &Config,
+    conn: &Connection,
+    registry: &AgentRegistry,
+) -> Result<SyncResult> {
+    let data = gather_data(config, registry).await?;
     apply_to_db(conn, &data)
 }
 
@@ -231,6 +239,87 @@ pub fn import_history(config: &Config, conn: &Connection) -> Result<usize> {
     }
 
     Ok(imported)
+}
+
+fn build_session(
+    pane: &tmux::AgentPaneInfo,
+    matched: Option<&AgentSessionFile>,
+    activity: &AgentActivity,
+) -> AgentSession {
+    match matched {
+        Some(sf) => AgentSession {
+            session_id: sf.session_id.clone(),
+            pid: sf.pid,
+            agent_type: pane.agent_type,
+            project_path: sf.cwd.clone(),
+            project_name: claude::project_name_from_path(&sf.cwd),
+            started_at: sf.started_at,
+            ended_at: None,
+            status: SessionStatus::Active,
+            first_prompt: None,
+            summary: None,
+            git_branch: None,
+            message_count: 0,
+            last_activity: Some(chrono::Utc::now().timestamp_millis()),
+            tmux_pane: Some(pane.tmux_ref.clone()),
+            pane_title: Some(pane.title.clone()),
+            activity: activity.clone(),
+            cpu_percent: 0.0,
+            memory_mb: 0.0,
+        },
+        None => AgentSession {
+            session_id: format!("tmux-{}", pane.tmux_ref.pane_id),
+            pid: Some(pane.pid),
+            agent_type: pane.agent_type,
+            project_path: pane.current_path.clone(),
+            project_name: claude::project_name_from_path(&pane.current_path),
+            started_at: chrono::Utc::now().timestamp_millis(),
+            ended_at: None,
+            status: SessionStatus::Active,
+            first_prompt: None,
+            summary: None,
+            git_branch: None,
+            message_count: 0,
+            last_activity: Some(chrono::Utc::now().timestamp_millis()),
+            tmux_pane: Some(pane.tmux_ref.clone()),
+            pane_title: Some(pane.title.clone()),
+            activity: activity.clone(),
+            cpu_percent: 0.0,
+            memory_mb: 0.0,
+        },
+    }
+}
+
+fn find_session_for_pane<'a>(
+    pane: &tmux::AgentPaneInfo,
+    pid_map: &'a HashMap<u32, &'a AgentSessionFile>,
+    claimed_session_ids: &[String],
+    tree: &stats::ProcessTree,
+) -> Option<&'a AgentSessionFile> {
+    if let Some(session) = pid_map.get(&pane.pid) {
+        if !claimed_session_ids.contains(&session.session_id) {
+            return Some(session);
+        }
+    }
+
+    for (pid, session) in pid_map {
+        if claimed_session_ids.contains(&session.session_id) {
+            continue;
+        }
+        if tree.is_descendant_of(pane.pid, *pid) {
+            return Some(session);
+        }
+    }
+
+    let cwd_matches: Vec<_> = pid_map
+        .values()
+        .filter(|s| s.cwd == pane.current_path && !claimed_session_ids.contains(&s.session_id))
+        .collect();
+    if cwd_matches.len() == 1 {
+        return Some(cwd_matches[0]);
+    }
+
+    None
 }
 
 fn sync_project_aggregates(conn: &Connection) -> Result<()> {
@@ -277,41 +366,6 @@ fn sync_project_aggregates(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
-}
-
-fn find_claude_session_for_pane<'a>(
-    pane: &tmux::AgentPaneInfo,
-    pid_map: &'a HashMap<u32, &'a claude::ClaudeSessionFile>,
-    claimed_session_ids: &[String],
-    tree: &stats::ProcessTree,
-) -> Option<&'a claude::ClaudeSessionFile> {
-    // Direct PID match
-    if let Some(session) = pid_map.get(&pane.pid) {
-        if !claimed_session_ids.contains(&session.session_id) {
-            return Some(session);
-        }
-    }
-
-    // Check if any claude session PID is a descendant of the pane PID
-    for (pid, session) in pid_map {
-        if claimed_session_ids.contains(&session.session_id) {
-            continue;
-        }
-        if tree.is_descendant_of(pane.pid, *pid) {
-            return Some(session);
-        }
-    }
-
-    // Fallback: match by cwd, only if exactly one unclaimed session matches
-    let cwd_matches: Vec<_> = pid_map
-        .values()
-        .filter(|s| s.cwd == pane.current_path && !claimed_session_ids.contains(&s.session_id))
-        .collect();
-    if cwd_matches.len() == 1 {
-        return Some(cwd_matches[0]);
-    }
-
-    None
 }
 
 #[derive(Debug, Default)]

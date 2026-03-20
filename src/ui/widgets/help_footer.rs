@@ -18,7 +18,12 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &ActiveView) {
     ];
 
     let view_keys: Vec<Span> = match view {
-        ActiveView::Dashboard => vec![key_hint("Space", "preview"), Span::raw("  ")],
+        ActiveView::Dashboard => vec![
+            key_hint("Space", "preview"),
+            Span::raw("  "),
+            key_hint("a", "agent"),
+            Span::raw("  "),
+        ],
         ActiveView::Projects => vec![
             key_hint("s", "sort"),
             Span::raw("  "),

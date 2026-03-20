@@ -1,6 +1,6 @@
 use ratatui::prelude::*;
 
-use crate::model::session::AgentActivity;
+use crate::model::session::{AgentActivity, AgentType};
 
 /// Spinner frames for "processing" (braille dots like Claude Code uses)
 const PROCESSING_FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠇"];
@@ -45,6 +45,14 @@ pub fn activity_span(activity: &AgentActivity, tick: u64) -> Span<'static> {
             )
         }
     }
+}
+
+/// Agent type icon in the agent's brand color.
+pub fn agent_type_span(agent_type: &AgentType) -> Span<'static> {
+    Span::styled(
+        format!("{} ", agent_type.icon()),
+        Style::default().fg(agent_type.color()),
+    )
 }
 
 /// Short text label for the activity state

@@ -10,6 +10,7 @@ use crate::event::action::Action;
 use crate::model::history::HistoryEntry;
 use crate::model::project::{Project, ProjectSort, StalenessLevel};
 use crate::model::session::AgentSession;
+use crate::model::session::AgentType;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveView {
@@ -84,6 +85,9 @@ pub struct App {
     pub search_active: bool,
     pub search_query: String,
 
+    // Agent filter (None = show all, Some(type) = show only that type)
+    pub agent_filter: Option<AgentType>,
+
     // Status
     pub last_error: Option<String>,
     pub status_message: Option<String>,
@@ -122,6 +126,7 @@ impl App {
             pane_preview: None,
             search_active: false,
             search_query: String::new(),
+            agent_filter: None,
             last_error: None,
             status_message: None,
         }
@@ -176,8 +181,22 @@ impl App {
             Action::ClearFilter => {
                 self.project_filter_forgotten = false;
                 self.history_filter_project = None;
+                self.agent_filter = None;
                 self.search_query.clear();
                 self.filter_projects();
+            }
+            Action::CycleAgentFilter => {
+                self.agent_filter = match self.agent_filter {
+                    None => Some(AgentType::Claude),
+                    Some(current) => {
+                        let all = AgentType::all();
+                        let idx = all.iter().position(|t| *t == current);
+                        match idx {
+                            Some(i) if i + 1 < all.len() => Some(all[i + 1]),
+                            _ => None, // wrap back to "all"
+                        }
+                    }
+                };
             }
             Action::ResumeSession => {
                 self.build_resume_command();
