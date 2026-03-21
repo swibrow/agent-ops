@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.4.0](https://github.com/swibrow/agent-ops/compare/v0.3.0...v0.4.0) (2026-03-21)
+
+
+### Features
+
+* add CLI with clap (--version, --poll-interval, --no-notifications, --reset-db) ([92e1525](https://github.com/swibrow/agent-ops/commit/92e1525399443a97e1c5f44d3e39f352d16e7434))
+* tmux window icons for agent activity and accurate last_activity tracking ([21a4c45](https://github.com/swibrow/agent-ops/commit/21a4c45f1e754563a57ddec0335309ba322c591b))
+
+
+### Bug Fixes
+
+* resolve clippy and fmt warnings from CI ([fff0640](https://github.com/swibrow/agent-ops/commit/fff0640663ae3419c7e0fe13df6244559a48ab4e))
+
 ## [0.3.0](https://github.com/swibrow/agent-ops/compare/v0.2.0...v0.3.0) (2026-03-20)
 
 
