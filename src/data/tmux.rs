@@ -157,7 +157,6 @@ pub async fn update_agent_window_titles(windows: &[AgentWindowState]) -> Result<
 }
 
 /// Strip icon prefixes from the given windows, restoring their original names.
-/// Uses a single tmux call to read all names, then a single chained call to rename.
 pub async fn reset_agent_window_titles(targets: &[String]) -> Result<()> {
     if targets.is_empty() {
         return Ok(());

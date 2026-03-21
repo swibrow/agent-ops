@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use clap::Parser;
 use crossterm::event::{Event, KeyEventKind};
 use rusqlite::Connection;
 use tokio::sync::mpsc;
@@ -28,6 +29,34 @@ use crate::db::schema;
 use crate::event::action::Action;
 use crate::event::handler::handle_key_event;
 
+/// agent-ops — htop for your AI coding agents
+///
+/// Monitor, track, and resume Claude Code and other AI agent sessions
+/// running in tmux.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// Polling interval in seconds for background sync
+    #[arg(short, long, default_value_t = 3)]
+    poll_interval: u64,
+
+    /// Disable desktop notifications
+    #[arg(long)]
+    no_notifications: bool,
+
+    /// Reset the database and re-import all session data
+    #[arg(long)]
+    reset_db: bool,
+
+    /// Print the log file path and exit
+    #[arg(long)]
+    log_path: bool,
+
+    /// Print the database path and exit
+    #[arg(long)]
+    db_path: bool,
+}
+
 /// Messages sent from background tasks to the UI
 enum SyncMsg {
     Data(sync::GatheredData),
@@ -36,10 +65,35 @@ enum SyncMsg {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let config = Config::new()?;
+    let cli = Cli::parse();
+    let mut config = Config::new()?;
+
+    // Apply CLI overrides
+    config.poll_interval_secs = cli.poll_interval;
+    if cli.no_notifications {
+        config.notifications_enabled = false;
+    }
+
+    // Info-only flags that print and exit
+    if cli.log_path {
+        println!("{}", config.log_path.display());
+        return Ok(());
+    }
+    if cli.db_path {
+        println!("{}", config.db_path.display());
+        return Ok(());
+    }
 
     if let Some(parent) = config.db_path.parent() {
         std::fs::create_dir_all(parent)?;
+    }
+
+    // Reset DB if requested
+    if cli.reset_db {
+        if config.db_path.exists() {
+            std::fs::remove_file(&config.db_path)?;
+            eprintln!("Database reset: {}", config.db_path.display());
+        }
     }
 
     // Set up logging
