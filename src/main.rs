@@ -89,11 +89,9 @@ async fn main() -> Result<()> {
     }
 
     // Reset DB if requested
-    if cli.reset_db {
-        if config.db_path.exists() {
-            std::fs::remove_file(&config.db_path)?;
-            eprintln!("Database reset: {}", config.db_path.display());
-        }
+    if cli.reset_db && config.db_path.exists() {
+        std::fs::remove_file(&config.db_path)?;
+        eprintln!("Database reset: {}", config.db_path.display());
     }
 
     // Set up logging
@@ -248,8 +246,7 @@ async fn main() -> Result<()> {
                             renamed_windows.insert(ws.target.clone());
                         }
 
-                        if let Err(e) =
-                            data::tmux::update_agent_window_titles(&window_states).await
+                        if let Err(e) = data::tmux::update_agent_window_titles(&window_states).await
                         {
                             warn!(error = %e, "failed to update tmux window titles");
                         }
