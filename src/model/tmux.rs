@@ -6,6 +6,8 @@ pub struct TmuxPane {
     #[allow(dead_code)]
     pub current_command: String,
     pub current_path: String,
+    /// Whether this pane is the active pane in its window.
+    pub active: bool,
 }
 
 #[derive(Debug, Clone)]

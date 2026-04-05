@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tracing::{debug, warn};
 
@@ -12,6 +12,7 @@ pub struct SessionInfo {
 
 /// Tracks previous activity states to detect transitions.
 /// When an agent transitions to WaitingForPermission, fires a macOS notification.
+/// Skips notifications for sessions whose pane is currently active (user is looking at it).
 pub struct NotificationTracker {
     previous_activities: HashMap<String, AgentActivity>,
     enabled: bool,
@@ -27,11 +28,13 @@ impl NotificationTracker {
 
     /// Check for activity transitions and send notifications.
     /// `session_info` maps session_id -> (agent_type, project_name) for richer messages.
+    /// `active_session_ids` contains sessions whose pane is currently focused — these are skipped.
     /// Returns the count of notifications sent.
     pub fn check_transitions(
         &mut self,
         current: &HashMap<String, AgentActivity>,
         session_info: &HashMap<String, SessionInfo>,
+        active_session_ids: &HashSet<String>,
     ) -> usize {
         if !self.enabled {
             self.previous_activities = current.clone();
@@ -46,7 +49,7 @@ impl NotificationTracker {
                 matches!(new_activity, AgentActivity::WaitingForPermission)
                     && !matches!(prev, Some(AgentActivity::WaitingForPermission));
 
-            if transitioned_to_permission {
+            if transitioned_to_permission && !active_session_ids.contains(session_id) {
                 debug!(session_id, "agent needs permission, sending notification");
                 let info = session_info.get(session_id);
                 send_notification(session_id, info);

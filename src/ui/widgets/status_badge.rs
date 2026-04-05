@@ -31,6 +31,9 @@ pub fn activity_span(activity: &AgentActivity, tick: u64) -> Span<'static> {
             };
             Span::styled(format!("{icon} "), Style::default().fg(color).bold())
         }
+        AgentActivity::Completed => {
+            Span::styled("✅ ".to_string(), Style::default().fg(Color::Green).bold())
+        }
         AgentActivity::Unknown => {
             let frame_idx = (tick / 8) as usize % 4;
             let colors = [
@@ -64,6 +67,9 @@ pub fn activity_label(activity: &AgentActivity) -> Span<'static> {
         AgentActivity::WaitingForInput => Span::styled("IDLE", Style::default().fg(Color::Green)),
         AgentActivity::WaitingForPermission => {
             Span::styled("NEEDS INPUT", Style::default().fg(Color::Yellow).bold())
+        }
+        AgentActivity::Completed => {
+            Span::styled("DONE", Style::default().fg(Color::Green).bold())
         }
         AgentActivity::Unknown => Span::styled("ACTIVE", Style::default().fg(Color::Green)),
     }

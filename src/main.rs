@@ -11,7 +11,7 @@ mod ui;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use clap::Parser;
@@ -28,6 +28,7 @@ use crate::data::sync;
 use crate::db::schema;
 use crate::event::action::Action;
 use crate::event::handler::handle_key_event;
+use crate::model::session::AgentActivity;
 
 /// agent-ops — htop for your AI coding agents
 ///
@@ -55,6 +56,14 @@ struct Cli {
     /// Print the database path and exit
     #[arg(long)]
     db_path: bool,
+
+    /// Additional Claude config directories to monitor (repeatable)
+    #[arg(long = "claude-dir", value_name = "DIR")]
+    claude_dirs: Vec<PathBuf>,
+
+    /// Print the config file path and exit
+    #[arg(long)]
+    config_path: bool,
 }
 
 /// Messages sent from background tasks to the UI
@@ -66,7 +75,7 @@ enum SyncMsg {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut config = Config::new()?;
+    let mut config = Config::new(&cli.claude_dirs)?;
 
     // Apply CLI overrides
     config.poll_interval_secs = cli.poll_interval;
@@ -81,6 +90,10 @@ async fn main() -> Result<()> {
     }
     if cli.db_path {
         println!("{}", config.db_path.display());
+        return Ok(());
+    }
+    if cli.config_path {
+        println!("{}", Config::config_path().display());
         return Ok(());
     }
 
@@ -137,13 +150,13 @@ async fn main() -> Result<()> {
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<SyncMsg>();
 
     // Spawn background sync task
-    let sync_claude_dir = config.claude_dir.clone();
+    let sync_claude_dirs = config.claude_dirs.clone();
     let sync_poll_interval = Duration::from_secs(config.poll_interval_secs);
     let sync_tx_poll = sync_tx.clone();
     let sync_registry = Arc::clone(&registry);
     tokio::spawn(async move {
         let cfg = Config {
-            claude_dir: sync_claude_dir,
+            claude_dirs: sync_claude_dirs,
             db_path: PathBuf::new(),
             log_path: PathBuf::new(),
             poll_interval_secs: 0,
@@ -165,19 +178,21 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Spawn filesystem watcher
-    let watch_dir = config.claude_dir.join("sessions");
-    let watch_tx = sync_tx.clone();
-    if watch_dir.exists() {
-        let watch_claude_dir = config.claude_dir.clone();
-        let watch_registry = Arc::clone(&registry);
-        tokio::spawn(async move {
-            if let Err(e) =
-                run_file_watcher(watch_dir, watch_tx, watch_claude_dir, watch_registry).await
-            {
-                warn!(error = %e, "filesystem watcher failed");
-            }
-        });
+    // Spawn filesystem watchers (one per claude dir)
+    for claude_dir in &config.claude_dirs {
+        let watch_dir = claude_dir.join("sessions");
+        if watch_dir.exists() {
+            let watch_tx = sync_tx.clone();
+            let watch_claude_dirs = config.claude_dirs.clone();
+            let watch_registry = Arc::clone(&registry);
+            tokio::spawn(async move {
+                if let Err(e) =
+                    run_file_watcher(watch_dir, watch_tx, watch_claude_dirs, watch_registry).await
+                {
+                    warn!(error = %e, "filesystem watcher failed");
+                }
+            });
+        }
     }
 
     // Notification tracker
@@ -185,6 +200,12 @@ async fn main() -> Result<()> {
 
     // Track which tmux windows we've renamed so we can reset them on shutdown
     let mut renamed_windows: HashSet<String> = HashSet::new();
+
+    // Track per-window activity from last sync cycle to detect transitions.
+    let mut prev_window_activities: HashMap<String, AgentActivity> = HashMap::new();
+    // Windows showing ✅ (completed) and when they completed.
+    let mut completed_windows: HashMap<String, Instant> = HashMap::new();
+    let completed_expiry = Duration::from_secs(600); // 10 minutes
 
     // Initialize terminal
     let mut terminal = tui::init()?;
@@ -211,11 +232,15 @@ async fn main() -> Result<()> {
                                 )
                             })
                             .collect();
-                        notifier.check_transitions(&result.activity_map, &session_info);
+                        notifier.check_transitions(
+                            &result.activity_map,
+                            &session_info,
+                            &result.active_session_ids,
+                        );
 
                         // Build per-window activity states from gathered pane data.
                         // Multiple panes can share a window — pick the highest priority.
-                        let mut window_activities: HashMap<String, model::session::AgentActivity> =
+                        let mut window_activities: HashMap<String, AgentActivity> =
                             HashMap::new();
                         for pane in &data.agent_panes {
                             let target = format!(
@@ -232,6 +257,84 @@ async fn main() -> Result<()> {
                                 *entry = activity;
                             }
                         }
+
+                        let now = Instant::now();
+
+                        // Detect completion transitions:
+                        // 1. Processing → WaitingForInput (agent finished work)
+                        // 2. Previously active window disappeared (agent exited)
+                        for (target, prev_activity) in &prev_window_activities {
+                            let cur_activity = window_activities.get(target);
+                            let just_completed = match (prev_activity, cur_activity) {
+                                // Agent was working, now idle → done
+                                (
+                                    AgentActivity::Processing,
+                                    Some(AgentActivity::WaitingForInput),
+                                ) => true,
+                                // Agent pane disappeared entirely → exited
+                                (AgentActivity::Processing, None) => true,
+                                (AgentActivity::WaitingForInput, None) => true,
+                                (AgentActivity::WaitingForPermission, None) => true,
+                                (AgentActivity::Unknown, None) => true,
+                                _ => false,
+                            };
+                            if just_completed && !completed_windows.contains_key(target) {
+                                completed_windows.insert(target.clone(), now);
+                            }
+                        }
+
+                        // If agent starts processing again, clear completed state
+                        for (target, activity) in &window_activities {
+                            if matches!(activity, AgentActivity::Processing) {
+                                completed_windows.remove(target);
+                            }
+                        }
+
+                        // Expire completed windows older than 10 minutes
+                        let expired: Vec<String> = completed_windows
+                            .iter()
+                            .filter(|(_, ts)| now.duration_since(**ts) >= completed_expiry)
+                            .map(|(t, _)| t.clone())
+                            .collect();
+                        if !expired.is_empty() {
+                            for t in &expired {
+                                completed_windows.remove(t);
+                            }
+                            // Reset icons for windows where agent exited (no longer in panes)
+                            let exited: Vec<String> = expired
+                                .iter()
+                                .filter(|t| !window_activities.contains_key(*t))
+                                .cloned()
+                                .collect();
+                            if !exited.is_empty() {
+                                if let Err(e) =
+                                    data::tmux::reset_agent_window_titles(&exited).await
+                                {
+                                    warn!(
+                                        error = %e,
+                                        "failed to reset expired completed windows"
+                                    );
+                                }
+                                for t in &exited {
+                                    renamed_windows.remove(t);
+                                }
+                            }
+                        }
+
+                        // Override activity to Completed for windows in the completed set
+                        for (target, _) in &completed_windows {
+                            window_activities
+                                .insert(target.clone(), AgentActivity::Completed);
+                        }
+
+                        // Save current activities for next cycle's transition detection
+                        prev_window_activities = window_activities
+                            .iter()
+                            .filter(|(_, a)| !matches!(a, AgentActivity::Completed))
+                            .map(|(t, a): (&String, &AgentActivity)| (t.clone(), a.clone()))
+                            .collect();
+                        // Also remember windows that disappeared so we can detect exits
+                        // (prev_window_activities already excludes completed overrides)
 
                         let window_states: Vec<data::tmux::AgentWindowState> = window_activities
                             .into_iter()
@@ -309,7 +412,7 @@ async fn main() -> Result<()> {
 async fn run_file_watcher(
     dir: PathBuf,
     tx: mpsc::UnboundedSender<SyncMsg>,
-    claude_dir: PathBuf,
+    claude_dirs: Vec<PathBuf>,
     registry: Arc<AgentRegistry>,
 ) -> Result<()> {
     use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
@@ -332,7 +435,7 @@ async fn run_file_watcher(
     let mut last_sync = std::time::Instant::now();
 
     let cfg = Config {
-        claude_dir,
+        claude_dirs,
         db_path: PathBuf::new(),
         log_path: PathBuf::new(),
         poll_interval_secs: 0,

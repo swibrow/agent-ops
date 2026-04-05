@@ -48,6 +48,7 @@ pub async fn gather_data(config: &Config, registry: &AgentRegistry) -> Result<Ga
                 current_path: pane.current_path.clone(),
                 agent_type: provider.agent_type(),
                 title_activity: activity,
+                pane_active: pane.active,
             });
         }
     }
@@ -74,26 +75,39 @@ pub async fn gather_data(config: &Config, registry: &AgentRegistry) -> Result<Ga
         }
     }
 
-    // Step 5: Refine activity for each pane (provider-specific I/O)
-    let mut pane_activities = HashMap::new();
-    for pane in &agent_panes {
-        // Find the provider for this pane's agent type
-        let refined = if let Some(provider) = registry
-            .providers()
-            .iter()
-            .find(|p| p.agent_type() == pane.agent_type)
-        {
-            provider
-                .refine_activity(&pane.tmux_ref.pane_id, pane.title_activity.clone())
-                .await
-        } else {
-            pane.title_activity.clone()
-        };
-        pane_activities.insert(pane.tmux_ref.pane_id.clone(), refined);
-    }
+    // Step 5: Refine activity for each pane (provider-specific I/O, run concurrently)
+    let refine_futures: Vec<_> = agent_panes
+        .iter()
+        .map(|pane| {
+            let pane_id = pane.tmux_ref.pane_id.clone();
+            let base_activity = pane.title_activity.clone();
+            let agent_type = pane.agent_type;
+            let provider = registry
+                .providers()
+                .iter()
+                .find(|p| p.agent_type() == agent_type);
+            async move {
+                let refined = if let Some(provider) = provider {
+                    provider
+                        .refine_activity(&pane_id, base_activity.clone())
+                        .await
+                } else {
+                    base_activity
+                };
+                (pane_id, refined)
+            }
+        })
+        .collect();
+    let refined_results = futures::future::join_all(refine_futures).await;
+    let pane_activities: HashMap<String, AgentActivity> = refined_results.into_iter().collect();
 
-    // Step 6: Read project session indexes (Claude-specific, but still useful for history)
-    let project_sessions = claude::read_project_sessions(&config.claude_dir).unwrap_or_default();
+    // Step 6: Read project session indexes from all claude dirs
+    let mut project_sessions = Vec::new();
+    for claude_dir in &config.claude_dirs {
+        if let Ok(sessions) = claude::read_project_sessions(claude_dir) {
+            project_sessions.extend(sessions);
+        }
+    }
 
     Ok(GatheredData {
         agent_panes,
@@ -201,6 +215,15 @@ pub fn apply_to_db(conn: &Connection, data: &GatheredData) -> Result<SyncResult>
         }
     }
 
+    // Track which sessions have their pane currently focused
+    for pane in &data.agent_panes {
+        if pane.pane_active {
+            if let Some(session_id) = pane_pid_to_session_id.get(&pane.pid) {
+                result.active_session_ids.insert(session_id.clone());
+            }
+        }
+    }
+
     result.self_stats = stats_by_pid.get(&self_pid).cloned().unwrap_or_default();
 
     info!(
@@ -223,13 +246,16 @@ pub async fn full_sync(
     apply_to_db(conn, &data)
 }
 
-/// Import history.jsonl entries into DB.
+/// Import history.jsonl entries from all claude dirs into DB.
 pub fn import_history(config: &Config, conn: &Connection) -> Result<usize> {
-    let entries = claude::read_history(&config.claude_dir)?;
     let mut imported = 0;
-    for entry in &entries {
-        if queries::insert_history(conn, entry).is_ok() {
-            imported += 1;
+    for claude_dir in &config.claude_dirs {
+        if let Ok(entries) = claude::read_history(claude_dir) {
+            for entry in &entries {
+                if queries::insert_history(conn, entry).is_ok() {
+                    imported += 1;
+                }
+            }
         }
     }
 
@@ -383,4 +409,6 @@ pub struct SyncResult {
     pub activity_map: ActivityMap,
     pub stats_map: HashMap<String, stats::ProcessStats>,
     pub self_stats: stats::ProcessStats,
+    /// Session IDs whose tmux pane is currently the active (focused) pane.
+    pub active_session_ids: std::collections::HashSet<String>,
 }

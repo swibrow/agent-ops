@@ -126,6 +126,7 @@ mod tests {
             title: title.to_string(),
             current_command: command.to_string(),
             current_path: "/tmp".to_string(),
+            active: false,
         }
     }
 

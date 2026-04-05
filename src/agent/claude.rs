@@ -47,34 +47,38 @@ impl AgentProvider for ClaudeProvider {
         &self,
         config: &Config,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<AgentSessionFile>>> + Send + '_>> {
-        let claude_dir = config.claude_dir.clone();
+        let claude_dirs = config.claude_dirs.clone();
         Box::pin(async move {
-            let sessions_dir = claude_dir.join("sessions");
-            if !sessions_dir.exists() {
-                return Ok(Vec::new());
-            }
-
             let mut result = Vec::new();
-            for entry in std::fs::read_dir(&sessions_dir)? {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            for claude_dir in &claude_dirs {
+                let sessions_dir = claude_dir.join("sessions");
+                if !sessions_dir.exists() {
                     continue;
                 }
-                match std::fs::read_to_string(&path) {
-                    Ok(content) => {
-                        if let Ok(session) =
-                            serde_json::from_str::<crate::data::claude::ClaudeSessionFile>(&content)
-                        {
-                            result.push(AgentSessionFile {
-                                session_id: session.session_id,
-                                pid: session.pid,
-                                cwd: session.cwd,
-                                started_at: session.started_at,
-                            });
-                        }
+
+                for entry in std::fs::read_dir(&sessions_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
                     }
-                    Err(_) => continue,
+                    match std::fs::read_to_string(&path) {
+                        Ok(content) => {
+                            if let Ok(session) =
+                                serde_json::from_str::<crate::data::claude::ClaudeSessionFile>(
+                                    &content,
+                                )
+                            {
+                                result.push(AgentSessionFile {
+                                    session_id: session.session_id,
+                                    pid: session.pid,
+                                    cwd: session.cwd,
+                                    started_at: session.started_at,
+                                });
+                            }
+                        }
+                        Err(_) => continue,
+                    }
                 }
             }
             Ok(result)
@@ -151,6 +155,7 @@ mod tests {
             title: title.to_string(),
             current_command: command.to_string(),
             current_path: "/tmp".to_string(),
+            active: false,
         }
     }
 

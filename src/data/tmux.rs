@@ -10,7 +10,7 @@ const SEP: &str = "|||";
 /// Returns a flat list of (session_name, window_index, pane).
 pub async fn list_all_panes() -> Result<Vec<(String, u32, TmuxPane)>> {
     let format_str = format!(
-        "#{{session_name}}{SEP}#{{window_index}}{SEP}#{{pane_id}}{SEP}#{{pane_pid}}{SEP}#{{pane_title}}{SEP}#{{pane_current_command}}{SEP}#{{pane_current_path}}"
+        "#{{session_name}}{SEP}#{{window_index}}{SEP}#{{pane_id}}{SEP}#{{pane_pid}}{SEP}#{{pane_title}}{SEP}#{{pane_current_command}}{SEP}#{{pane_current_path}}{SEP}#{{pane_active}}"
     );
 
     let output = Command::new("tmux")
@@ -27,7 +27,7 @@ pub async fn list_all_panes() -> Result<Vec<(String, u32, TmuxPane)>> {
 
     for line in stdout.lines() {
         let parts: Vec<&str> = line.split(SEP).collect();
-        if parts.len() < 7 {
+        if parts.len() < 8 {
             continue;
         }
 
@@ -40,6 +40,7 @@ pub async fn list_all_panes() -> Result<Vec<(String, u32, TmuxPane)>> {
             title: parts[4].to_string(),
             current_command: parts[5].to_string(),
             current_path: parts[6].to_string(),
+            active: parts[7] == "1",
         };
 
         panes.push((session_name, window_index, pane));
@@ -57,10 +58,12 @@ pub struct AgentPaneInfo {
     pub current_path: String,
     pub agent_type: AgentType,
     pub title_activity: crate::model::session::AgentActivity,
+    /// Whether this pane is the active (focused) pane in its tmux window.
+    pub pane_active: bool,
 }
 
 /// All icon prefixes we may prepend to window names.
-const ACTIVITY_ICONS: &[&str] = &["🔔", "💬", "⏳", "🤖"];
+const ACTIVITY_ICONS: &[&str] = &["🔔", "💬", "⏳", "🤖", "✅"];
 
 /// An agent window whose title may need updating.
 pub struct AgentWindowState {
@@ -75,6 +78,7 @@ fn activity_icon(activity: &AgentActivity) -> &'static str {
         AgentActivity::WaitingForPermission => "🔔",
         AgentActivity::WaitingForInput => "💬",
         AgentActivity::Processing => "⏳",
+        AgentActivity::Completed => "✅",
         AgentActivity::Unknown => "🤖",
     }
 }
@@ -238,6 +242,11 @@ mod tests {
     }
 
     #[test]
+    fn strip_icon_prefix_removes_checkmark() {
+        assert_eq!(strip_icon_prefix("✅ claude"), "claude");
+    }
+
+    #[test]
     fn strip_icon_prefix_leaves_other_emoji() {
         assert_eq!(strip_icon_prefix("✳ claude"), "✳ claude");
     }
@@ -246,7 +255,7 @@ mod tests {
         let mut panes = Vec::new();
         for line in output.lines() {
             let parts: Vec<&str> = line.split(SEP).collect();
-            if parts.len() < 7 {
+            if parts.len() < 8 {
                 continue;
             }
             let session_name = parts[0].to_string();
@@ -257,6 +266,7 @@ mod tests {
                 title: parts[4].to_string(),
                 current_command: parts[5].to_string(),
                 current_path: parts[6].to_string(),
+                active: parts[7] == "1",
             };
             panes.push((session_name, window_index, pane));
         }
@@ -265,7 +275,7 @@ mod tests {
 
     #[test]
     fn parse_single_pane() {
-        let output = "main|||0|||%1|||1234|||\u{2733} Claude|||node|||/home/user/project";
+        let output = "main|||0|||%1|||1234|||\u{2733} Claude|||node|||/home/user/project|||1";
         let panes = parse_tmux_output(output);
         assert_eq!(panes.len(), 1);
         let (session, window, pane) = &panes[0];
@@ -276,27 +286,31 @@ mod tests {
         assert!(pane.title.contains("Claude"));
         assert_eq!(pane.current_command, "node");
         assert_eq!(pane.current_path, "/home/user/project");
+        assert!(pane.active);
     }
 
     #[test]
     fn parse_multiple_panes() {
         let output = "\
-main|||0|||%1|||1234|||\u{2733} Claude|||node|||/home/user/project
-work|||1|||%2|||5678|||bash|||bash|||/tmp
-dev|||2|||%3|||9012|||\u{2801} Processing|||claude|||/home/user/other";
+main|||0|||%1|||1234|||\u{2733} Claude|||node|||/home/user/project|||1
+work|||1|||%2|||5678|||bash|||bash|||/tmp|||0
+dev|||2|||%3|||9012|||\u{2801} Processing|||claude|||/home/user/other|||1";
         let panes = parse_tmux_output(output);
         assert_eq!(panes.len(), 3);
         assert_eq!(panes[0].0, "main");
+        assert!(panes[0].2.active);
         assert_eq!(panes[1].0, "work");
+        assert!(!panes[1].2.active);
         assert_eq!(panes[2].0, "dev");
+        assert!(panes[2].2.active);
     }
 
     #[test]
     fn parse_skips_malformed_lines() {
         let output = "\
-main|||0|||%1|||1234|||\u{2733} Claude|||node|||/home/user/project
+main|||0|||%1|||1234|||\u{2733} Claude|||node|||/home/user/project|||1
 incomplete|||line
-|||too|||few";
+|||too|||few|||fields";
         let panes = parse_tmux_output(output);
         assert_eq!(panes.len(), 1);
     }
@@ -309,7 +323,7 @@ incomplete|||line
 
     #[test]
     fn parse_invalid_pid_defaults_to_zero() {
-        let output = "main|||0|||%1|||not_a_number|||\u{2733} Claude|||node|||/tmp";
+        let output = "main|||0|||%1|||not_a_number|||\u{2733} Claude|||node|||/tmp|||1";
         let panes = parse_tmux_output(output);
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].2.pid, 0);
@@ -317,9 +331,10 @@ incomplete|||line
 
     #[test]
     fn parse_invalid_window_index_defaults_to_zero() {
-        let output = "main|||abc|||%1|||1234|||\u{2733} Claude|||node|||/tmp";
+        let output = "main|||abc|||%1|||1234|||\u{2733} Claude|||node|||/tmp|||0";
         let panes = parse_tmux_output(output);
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].1, 0);
+        assert!(!panes[0].2.active);
     }
 }

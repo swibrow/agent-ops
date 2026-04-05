@@ -91,6 +91,8 @@ pub enum AgentActivity {
     WaitingForInput,
     /// Agent is waiting for permission (e.g. "Do you want to proceed?")
     WaitingForPermission,
+    /// Agent has finished its work (pane exited or returned to shell)
+    Completed,
     #[default]
     /// Unknown or not applicable
     Unknown,
@@ -102,9 +104,10 @@ impl AgentActivity {
     pub fn sort_priority(&self) -> u8 {
         match self {
             Self::WaitingForPermission => 0,
-            Self::Processing => 1,
-            Self::Unknown => 2,
-            Self::WaitingForInput => 3,
+            Self::Completed => 1,
+            Self::Processing => 2,
+            Self::Unknown => 3,
+            Self::WaitingForInput => 4,
         }
     }
 }
