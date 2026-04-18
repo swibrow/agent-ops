@@ -23,7 +23,8 @@ pub fn handle_key_event(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Action::Quit,
         KeyCode::Char('1') => return Action::SwitchTab(ActiveView::Dashboard),
         KeyCode::Char('2') => return Action::SwitchTab(ActiveView::Projects),
-        KeyCode::Char('3') => return Action::SwitchTab(ActiveView::History),
+        KeyCode::Char('3') => return Action::SwitchTab(ActiveView::Review),
+        KeyCode::Char('4') => return Action::SwitchTab(ActiveView::History),
         KeyCode::Tab | KeyCode::Char('l') => return Action::NextTab,
         KeyCode::BackTab | KeyCode::Char('h') => return Action::PrevTab,
         KeyCode::Char('?') => return Action::ToggleHelp,
@@ -52,7 +53,10 @@ pub fn handle_key_event(key: KeyEvent, app: &App) -> Action {
         KeyCode::Char('k') | KeyCode::Up => Action::SelectPrev,
         KeyCode::Char('g') => Action::SelectFirst,
         KeyCode::Char('G') => Action::SelectLast,
-        KeyCode::Enter => Action::Confirm,
+        KeyCode::Enter => match app.active_view {
+            ActiveView::Review => Action::ToggleReviewExpand,
+            _ => Action::Confirm,
+        },
         KeyCode::Char(' ') => Action::TogglePreview,
         KeyCode::Char('r') => Action::ResumeSession,
         KeyCode::Char('R') => Action::Refresh,
@@ -62,6 +66,14 @@ pub fn handle_key_event(key: KeyEvent, app: &App) -> Action {
         },
         KeyCode::Char('f') => match app.active_view {
             ActiveView::Projects | ActiveView::History => Action::FilterStale,
+            _ => Action::None,
+        },
+        KeyCode::Char('t') => match app.active_view {
+            ActiveView::Review => Action::CycleReviewRange,
+            _ => Action::None,
+        },
+        KeyCode::Char('T') => match app.active_view {
+            ActiveView::Review => Action::CycleReviewRangeBack,
             _ => Action::None,
         },
         KeyCode::Char('F') => Action::ClearFilter,
@@ -155,6 +167,10 @@ mod tests {
         );
         assert_eq!(
             handle_key_event(key(KeyCode::Char('3')), &app),
+            Action::SwitchTab(ActiveView::Review),
+        );
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('4')), &app),
             Action::SwitchTab(ActiveView::History),
         );
     }

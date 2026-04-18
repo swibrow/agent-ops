@@ -2,11 +2,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 use anyhow::Result;
+use rusqlite::Connection;
 use tracing::warn;
 
 use crate::agent::{AgentProvider, AgentSessionFile};
 use crate::config::Config;
-use crate::data::tmux;
+use crate::data::{tmux, transcripts};
 use crate::model::session::{AgentActivity, AgentType};
 use crate::model::tmux::TmuxPane;
 
@@ -134,6 +135,10 @@ impl AgentProvider for ClaudeProvider {
                 base
             }
         })
+    }
+
+    fn ingest_transcripts(&self, config: &Config, conn: &Connection) -> Result<usize> {
+        transcripts::ingest_all_claude_dirs(conn, &config.claude_dirs)
     }
 }
 

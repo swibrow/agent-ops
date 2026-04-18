@@ -73,7 +73,8 @@ fn build_subtitle_line<'a>(
     let tabs = [
         ("1", "Dashboard", ActiveView::Dashboard),
         ("2", "Projects", ActiveView::Projects),
-        ("3", "History", ActiveView::History),
+        ("3", "Review", ActiveView::Review),
+        ("4", "History", ActiveView::History),
     ];
 
     // Build left: tabs

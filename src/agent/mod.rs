@@ -8,6 +8,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use anyhow::Result;
+use rusqlite::Connection;
 
 use crate::config::Config;
 use crate::model::session::{AgentActivity, AgentType};
@@ -59,6 +60,13 @@ pub trait AgentProvider: Send + Sync {
         base: AgentActivity,
     ) -> Pin<Box<dyn Future<Output = AgentActivity> + Send + '_>> {
         Box::pin(async move { base })
+    }
+
+    /// Ingest all persisted transcripts for this agent into the DB.
+    /// Default: no-op (agent doesn't persist transcripts yet).
+    /// Claude implements this. TODO: OpenCode, Codex, Gemini, Aider.
+    fn ingest_transcripts(&self, _config: &Config, _conn: &Connection) -> Result<usize> {
+        Ok(0)
     }
 }
 

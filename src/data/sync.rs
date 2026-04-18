@@ -15,6 +15,13 @@ use crate::model::tmux::TmuxPaneRef;
 /// Maps session_id -> activity for overlaying onto DB results
 pub type ActivityMap = HashMap<String, AgentActivity>;
 
+/// Parse an ISO 8601 timestamp string to Unix milliseconds.
+fn parse_iso_to_millis(s: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
 /// Raw data gathered from async I/O (tmux, ps, files).
 /// This struct is Send and can be passed across threads.
 pub struct GatheredData {
@@ -181,14 +188,15 @@ pub fn apply_to_db(conn: &Connection, data: &GatheredData) -> Result<SyncResult>
                 agent_type: AgentType::Claude,
                 project_path: project_path.clone(),
                 project_name: claude::project_name_from_path(project_path),
-                started_at: entry.created.unwrap_or(0),
-                ended_at: entry.modified,
+                started_at: entry.created.as_deref().and_then(parse_iso_to_millis).unwrap_or(0),
+                ended_at: entry.modified.as_deref().and_then(parse_iso_to_millis),
                 status: SessionStatus::Completed,
                 first_prompt: entry.first_prompt.clone(),
                 summary: entry.summary.clone(),
                 git_branch: entry.git_branch.clone(),
                 message_count: entry.message_count.unwrap_or(0),
-                last_activity: entry.modified.or(entry.created),
+                last_activity: entry.modified.as_deref().and_then(parse_iso_to_millis)
+                    .or_else(|| entry.created.as_deref().and_then(parse_iso_to_millis)),
                 tmux_pane: None,
                 pane_title: None,
                 activity: AgentActivity::Unknown,
@@ -244,6 +252,47 @@ pub async fn full_sync(
 ) -> Result<SyncResult> {
     let data = gather_data(config, registry).await?;
     apply_to_db(conn, &data)
+}
+
+/// Ingest full transcripts from every registered agent provider.
+/// This calls each provider's `ingest_transcripts` method. Idempotent and cheap
+/// on repeat thanks to the `ingest_state` tracking table.
+pub fn ingest_transcripts(
+    config: &Config,
+    conn: &Connection,
+    registry: &AgentRegistry,
+) -> Result<usize> {
+    let mut total = 0;
+    for provider in registry.providers() {
+        match provider.ingest_transcripts(config, conn) {
+            Ok(n) => {
+                if n > 0 {
+                    info!(
+                        agent = provider.agent_type().as_str(),
+                        count = n,
+                        "ingested transcript messages"
+                    );
+                }
+                total += n;
+            }
+            Err(e) => {
+                warn!(
+                    agent = provider.agent_type().as_str(),
+                    error = %e,
+                    "transcript ingest failed"
+                );
+            }
+        }
+    }
+
+    // Apply retention policy
+    if let Ok(pruned) = crate::data::transcripts::prune_old_messages(conn, config.transcript_retention_days) {
+        if pruned > 0 {
+            info!(count = pruned, "pruned old transcript messages");
+        }
+    }
+
+    Ok(total)
 }
 
 /// Import history.jsonl entries from all claude dirs into DB.

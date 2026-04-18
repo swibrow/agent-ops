@@ -35,5 +35,9 @@ pub enum Action {
     OpenInEditor,
     // Agent filter
     CycleAgentFilter,
+    // Review
+    CycleReviewRange,
+    CycleReviewRangeBack,
+    ToggleReviewExpand,
     None,
 }

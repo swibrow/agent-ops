@@ -54,11 +54,34 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             UNIQUE(timestamp, project_path)
         );
 
+        CREATE TABLE IF NOT EXISTS messages (
+            uuid            TEXT PRIMARY KEY,
+            session_id      TEXT NOT NULL,
+            agent_type      TEXT NOT NULL,
+            role            TEXT NOT NULL,
+            content         TEXT NOT NULL,
+            timestamp       INTEGER NOT NULL,
+            project_path    TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS ingest_state (
+            file_path       TEXT PRIMARY KEY,
+            agent_type      TEXT NOT NULL,
+            mtime           INTEGER NOT NULL,
+            size            INTEGER NOT NULL,
+            message_count   INTEGER NOT NULL DEFAULT 0,
+            last_ingested   INTEGER NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_sessions_project ON sessions(project_path);
         CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status);
         CREATE INDEX IF NOT EXISTS idx_history_project ON history(project_path);
         CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp);
         CREATE INDEX IF NOT EXISTS idx_daily_activity_project ON daily_activity(project_path);
+        CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_project ON messages(project_path);
+        CREATE INDEX IF NOT EXISTS idx_messages_timestamp ON messages(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_type);
         ",
     )?;
 
@@ -76,6 +99,21 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_sessions_agent_type ON sessions(agent_type);",
     )?;
+
+    // Migration: add token usage columns to messages table
+    let has_tokens: bool = conn
+        .prepare("SELECT input_tokens FROM messages LIMIT 0")
+        .is_ok();
+    if !has_tokens {
+        conn.execute_batch(
+            "ALTER TABLE messages ADD COLUMN input_tokens INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE messages ADD COLUMN output_tokens INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE messages ADD COLUMN cache_creation_tokens INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE messages ADD COLUMN cache_read_tokens INTEGER NOT NULL DEFAULT 0;
+             -- Clear ingest state so all files are re-ingested to backfill token data
+             DELETE FROM ingest_state;",
+        )?;
+    }
 
     Ok(())
 }

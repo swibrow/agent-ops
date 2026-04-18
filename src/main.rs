@@ -7,6 +7,7 @@ mod event;
 mod model;
 mod tui;
 mod ui;
+mod web;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -64,6 +65,19 @@ struct Cli {
     /// Print the config file path and exit
     #[arg(long)]
     config_path: bool,
+
+    /// Start the web server alongside the TUI.
+    /// Use --web-only to run the web server without the TUI.
+    #[arg(long)]
+    web: bool,
+
+    /// Start the web server without the TUI (implies --web).
+    #[arg(long)]
+    web_only: bool,
+
+    /// Port for the web server (used with --web / --web-only)
+    #[arg(long, default_value_t = 3000)]
+    port: u16,
 }
 
 /// Messages sent from background tasks to the UI
@@ -128,6 +142,33 @@ async fn main() -> Result<()> {
     // Agent registry
     let registry = Arc::new(AgentRegistry::default_registry());
 
+    // --web-only: headless web server, no TUI.
+    if cli.web_only {
+        return web::run(&config, registry, cli.port).await;
+    }
+
+    // --web: spin up the web server alongside the TUI so you can browse
+    // from the dashboard while working. We spawn it as a background task
+    // and continue into the TUI path below.
+    if cli.web {
+        let web_config = crate::config::Config {
+            claude_dirs: config.claude_dirs.clone(),
+            db_path: config.db_path.clone(),
+            log_path: config.log_path.clone(),
+            poll_interval_secs: config.poll_interval_secs,
+            tick_rate_ms: config.tick_rate_ms,
+            notifications_enabled: false, // TUI handles notifications
+            transcript_retention_days: config.transcript_retention_days,
+        };
+        let web_registry = Arc::clone(&registry);
+        let port = cli.port;
+        tokio::spawn(async move {
+            if let Err(e) = web::run_embedded(&web_config, web_registry, port).await {
+                warn!(error = %e, "embedded web server exited");
+            }
+        });
+    }
+
     // Open DB and run migrations
     let conn = Connection::open(&config.db_path)?;
     schema::run_migrations(&conn)?;
@@ -136,6 +177,11 @@ async fn main() -> Result<()> {
     let history_count = sync::import_history(&config, &conn)?;
     if history_count > 0 {
         info!(count = history_count, "imported history entries");
+    }
+
+    // Ingest full transcripts (idempotent; cheap on repeat)
+    if let Err(e) = sync::ingest_transcripts(&config, &conn, &registry) {
+        warn!(error = %e, "initial transcript ingest failed");
     }
 
     // Initial sync
@@ -154,14 +200,17 @@ async fn main() -> Result<()> {
     let sync_poll_interval = Duration::from_secs(config.poll_interval_secs);
     let sync_tx_poll = sync_tx.clone();
     let sync_registry = Arc::clone(&registry);
+    let sync_db_path = config.db_path.clone();
+    let sync_retention = config.transcript_retention_days;
     tokio::spawn(async move {
         let cfg = Config {
             claude_dirs: sync_claude_dirs,
-            db_path: PathBuf::new(),
+            db_path: sync_db_path,
             log_path: PathBuf::new(),
             poll_interval_secs: 0,
             tick_rate_ms: 0,
             notifications_enabled: false,
+            transcript_retention_days: sync_retention,
         };
 
         loop {
@@ -175,19 +224,49 @@ async fn main() -> Result<()> {
                     let _ = sync_tx_poll.send(SyncMsg::Error(format!("Sync failed: {e}")));
                 }
             }
+
+            // Hot-reload transcripts: re-scan JSONL files for changes.
+            // Uses its own short-lived connection to avoid contention with the
+            // main thread's DB usage.
+            if let Ok(ingest_conn) = rusqlite::Connection::open(&cfg.db_path) {
+                if let Err(e) = sync::ingest_transcripts(&cfg, &ingest_conn, &sync_registry) {
+                    warn!(error = %e, "background transcript ingest failed");
+                }
+            }
         }
     });
 
-    // Spawn filesystem watchers (one per claude dir)
-    for claude_dir in &config.claude_dirs {
-        let watch_dir = claude_dir.join("sessions");
-        if watch_dir.exists() {
+    // Spawn filesystem watchers. We watch both `sessions/` (active session
+    // metadata) and `projects/` (full JSONL transcripts, recursively) so that
+    // transcript ingest hot-reloads when any agent writes.
+    {
+        let mut watch_dirs: Vec<PathBuf> = Vec::new();
+        for claude_dir in &config.claude_dirs {
+            let sessions_dir = claude_dir.join("sessions");
+            if sessions_dir.exists() {
+                watch_dirs.push(sessions_dir);
+            }
+            let projects_dir = claude_dir.join("projects");
+            if projects_dir.exists() {
+                watch_dirs.push(projects_dir);
+            }
+        }
+        if !watch_dirs.is_empty() {
             let watch_tx = sync_tx.clone();
             let watch_claude_dirs = config.claude_dirs.clone();
             let watch_registry = Arc::clone(&registry);
+            let watch_db_path = config.db_path.clone();
+            let watch_retention = config.transcript_retention_days;
             tokio::spawn(async move {
-                if let Err(e) =
-                    run_file_watcher(watch_dir, watch_tx, watch_claude_dirs, watch_registry).await
+                if let Err(e) = run_file_watcher(
+                    watch_dirs,
+                    watch_tx,
+                    watch_claude_dirs,
+                    watch_registry,
+                    watch_db_path,
+                    watch_retention,
+                )
+                .await
                 {
                     warn!(error = %e, "filesystem watcher failed");
                 }
@@ -213,6 +292,11 @@ async fn main() -> Result<()> {
     let tick_rate = Duration::from_millis(config.tick_rate_ms);
 
     loop {
+        // Refresh review data lazily when it's dirty and visible.
+        if app.review_dirty && matches!(app.active_view, crate::app::ActiveView::Review) {
+            app.load_review(&conn);
+        }
+
         terminal.draw(|frame| ui::draw(frame, &app))?;
 
         while let Ok(msg) = sync_rx.try_recv() {
@@ -410,10 +494,12 @@ async fn main() -> Result<()> {
 }
 
 async fn run_file_watcher(
-    dir: PathBuf,
+    dirs: Vec<PathBuf>,
     tx: mpsc::UnboundedSender<SyncMsg>,
     claude_dirs: Vec<PathBuf>,
     registry: Arc<AgentRegistry>,
+    db_path: PathBuf,
+    retention_days: Option<u32>,
 ) -> Result<()> {
     use notify::{Config as NotifyConfig, RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -428,19 +514,27 @@ async fn run_file_watcher(
         NotifyConfig::default(),
     )?;
 
-    watcher.watch(&dir, RecursiveMode::NonRecursive)?;
-    info!(dir = %dir.display(), "watching for session file changes");
+    for dir in &dirs {
+        // Recursive because the `projects/` tree has per-project subdirs
+        // containing the JSONL transcripts we want to pick up.
+        if let Err(e) = watcher.watch(dir, RecursiveMode::Recursive) {
+            warn!(dir = %dir.display(), error = %e, "failed to watch dir");
+        } else {
+            info!(dir = %dir.display(), "watching for session file changes");
+        }
+    }
 
     let debounce = Duration::from_millis(500);
     let mut last_sync = std::time::Instant::now();
 
     let cfg = Config {
         claude_dirs,
-        db_path: PathBuf::new(),
+        db_path: db_path.clone(),
         log_path: PathBuf::new(),
         poll_interval_secs: 0,
         tick_rate_ms: 0,
         notifications_enabled: false,
+        transcript_retention_days: retention_days,
     };
 
     loop {
@@ -462,6 +556,15 @@ async fn run_file_watcher(
                 let _ = tx.send(SyncMsg::Error(format!("Watch-triggered sync failed: {e}")));
             }
         }
+
+        // Also re-ingest transcripts on file change. Uses its own connection
+        // to avoid contention with the main loop's connection.
+        if let Ok(ingest_conn) = rusqlite::Connection::open(&db_path) {
+            if let Err(e) = sync::ingest_transcripts(&cfg, &ingest_conn, &registry) {
+                warn!(error = %e, "watch-triggered transcript ingest failed");
+            }
+        }
+
         last_sync = std::time::Instant::now();
     }
 

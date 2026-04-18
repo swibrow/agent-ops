@@ -33,6 +33,12 @@ pub fn draw(frame: &mut Frame, area: Rect, view: &ActiveView) {
             Span::raw("  "),
         ],
         ActiveView::History => vec![key_hint("f", "filter"), Span::raw("  ")],
+        ActiveView::Review => vec![
+            key_hint("t/T", "range"),
+            Span::raw("  "),
+            key_hint("Enter", "expand"),
+            Span::raw("  "),
+        ],
     };
 
     let mut spans = vec![Span::raw(" ")];

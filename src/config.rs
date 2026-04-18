@@ -8,6 +8,9 @@ use serde::Deserialize;
 struct FileConfig {
     #[serde(default)]
     claude_dirs: Vec<PathBuf>,
+    /// Keep transcripts older than this many days? 0 or unset = unlimited.
+    #[serde(default)]
+    transcript_retention_days: Option<u32>,
 }
 
 pub struct Config {
@@ -17,6 +20,8 @@ pub struct Config {
     pub poll_interval_secs: u64,
     pub tick_rate_ms: u64,
     pub notifications_enabled: bool,
+    /// Days of transcript history to keep. None = unlimited.
+    pub transcript_retention_days: Option<u32>,
 }
 
 impl Config {
@@ -59,6 +64,7 @@ impl Config {
             poll_interval_secs: 3,
             tick_rate_ms: 50,
             notifications_enabled: true,
+            transcript_retention_days: file_config.transcript_retention_days,
         })
     }
 

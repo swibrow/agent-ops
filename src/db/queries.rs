@@ -1,8 +1,11 @@
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
+use std::collections::{HashMap, HashSet};
+
 use crate::model::history::HistoryEntry;
 use crate::model::project::{Project, StalenessLevel};
+use crate::model::review::{ReviewProject, ReviewSession, ReviewSummary};
 use crate::model::session::{AgentActivity, AgentSession, AgentType, SessionStatus};
 use crate::model::tmux::TmuxPaneRef;
 
@@ -264,6 +267,304 @@ pub fn mark_sessions_completed(conn: &Connection, active_pane_ids: &[String]) ->
 
     let changed = conn.execute(&sql, rusqlite::params_from_iter(all_params.iter()))?;
     Ok(changed)
+}
+
+/// Extract display text from a content JSON blob (first text block or string).
+/// Used for "key prompts" in review output.
+fn content_to_text(content_json: &str, max_chars: usize) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(content_json).ok()?;
+    let raw = if let Some(s) = value.as_str() {
+        s.to_string()
+    } else if let Some(arr) = value.as_array() {
+        let mut buf = String::new();
+        for block in arr {
+            let btype = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+            if btype == "text" {
+                if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                    if !buf.is_empty() {
+                        buf.push(' ');
+                    }
+                    buf.push_str(t);
+                }
+            }
+            // Skip tool_result and other noise
+        }
+        buf
+    } else {
+        return None;
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.chars().count() > max_chars {
+        Some(format!(
+            "{}...",
+            trimmed.chars().take(max_chars).collect::<String>()
+        ))
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Build a review summary for messages with timestamps in `[from, to]`.
+/// Groups by project -> session and pulls metadata from the `sessions` table
+/// where available. `project_filter` is an optional substring match.
+pub fn build_review(
+    conn: &Connection,
+    from: i64,
+    to: i64,
+    project_filter: Option<&str>,
+    max_prompts_per_session: usize,
+) -> Result<ReviewSummary> {
+    let project_like = project_filter.map(|p| format!("%{p}%"));
+
+    let sql = if project_like.is_some() {
+        "SELECT session_id, agent_type, role, content, timestamp, project_path,
+                input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
+         FROM messages
+         WHERE timestamp BETWEEN ?1 AND ?2
+           AND project_path LIKE ?3
+         ORDER BY timestamp ASC"
+    } else {
+        "SELECT session_id, agent_type, role, content, timestamp, project_path,
+                input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens
+         FROM messages
+         WHERE timestamp BETWEEN ?1 AND ?2
+         ORDER BY timestamp ASC"
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+
+    struct Row {
+        session_id: String,
+        agent_type: String,
+        role: String,
+        content: String,
+        timestamp: i64,
+        project_path: String,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_creation_tokens: i64,
+        cache_read_tokens: i64,
+    }
+
+    let rows: Vec<Row> = if let Some(ref p) = project_like {
+        stmt.query_map(params![from, to, p], |row| {
+            Ok(Row {
+                session_id: row.get(0)?,
+                agent_type: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                timestamp: row.get(4)?,
+                project_path: row.get(5)?,
+                input_tokens: row.get(6).unwrap_or(0),
+                output_tokens: row.get(7).unwrap_or(0),
+                cache_creation_tokens: row.get(8).unwrap_or(0),
+                cache_read_tokens: row.get(9).unwrap_or(0),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![from, to], |row| {
+            Ok(Row {
+                session_id: row.get(0)?,
+                agent_type: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                timestamp: row.get(4)?,
+                project_path: row.get(5)?,
+                input_tokens: row.get(6).unwrap_or(0),
+                output_tokens: row.get(7).unwrap_or(0),
+                cache_creation_tokens: row.get(8).unwrap_or(0),
+                cache_read_tokens: row.get(9).unwrap_or(0),
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    // Aggregate per session_id
+    struct SessionAgg {
+        agent_type: String,
+        started_at: i64,
+        last_activity: i64,
+        message_count: usize,
+        project_path: String,
+        user_prompts: Vec<String>,
+        input_tokens: i64,
+        output_tokens: i64,
+        cache_creation_tokens: i64,
+        cache_read_tokens: i64,
+    }
+
+    let mut by_session: HashMap<String, SessionAgg> = HashMap::new();
+    let mut summary = ReviewSummary {
+        from,
+        to,
+        ..ReviewSummary::default()
+    };
+
+    for row in rows {
+        summary.total_messages += 1;
+        match row.role.as_str() {
+            "user" => summary.user_messages += 1,
+            "assistant" => summary.assistant_messages += 1,
+            _ => {}
+        }
+        *summary.agents.entry(row.agent_type.clone()).or_insert(0) += 1;
+        summary.total_input_tokens += row.input_tokens;
+        summary.total_output_tokens += row.output_tokens;
+        summary.total_cache_creation_tokens += row.cache_creation_tokens;
+        summary.total_cache_read_tokens += row.cache_read_tokens;
+
+        let entry = by_session
+            .entry(row.session_id.clone())
+            .or_insert_with(|| SessionAgg {
+                agent_type: row.agent_type.clone(),
+                started_at: row.timestamp,
+                last_activity: row.timestamp,
+                message_count: 0,
+                project_path: row.project_path.clone(),
+                user_prompts: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            });
+        entry.message_count += 1;
+        entry.input_tokens += row.input_tokens;
+        entry.output_tokens += row.output_tokens;
+        entry.cache_creation_tokens += row.cache_creation_tokens;
+        entry.cache_read_tokens += row.cache_read_tokens;
+        if row.timestamp < entry.started_at {
+            entry.started_at = row.timestamp;
+        }
+        if row.timestamp > entry.last_activity {
+            entry.last_activity = row.timestamp;
+        }
+        if row.role == "user" && entry.user_prompts.len() < max_prompts_per_session {
+            if let Some(text) = content_to_text(&row.content, 280) {
+                entry.user_prompts.push(text);
+            }
+        }
+    }
+
+    // Pull session metadata from sessions table
+    let session_ids: Vec<String> = by_session.keys().cloned().collect();
+    let mut meta: HashMap<String, (Option<String>, Option<String>, Option<String>)> =
+        HashMap::new();
+    if !session_ids.is_empty() {
+        let placeholders = (0..session_ids.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT session_id, first_prompt, summary, git_branch FROM sessions WHERE session_id IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_vec: Vec<&dyn rusqlite::ToSql> = session_ids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
+        let iter = stmt.query_map(params_vec.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        for r in iter.flatten() {
+            meta.insert(r.0, (r.1, r.2, r.3));
+        }
+    }
+
+    // Group by project
+    let mut by_project: HashMap<String, Vec<(String, SessionAgg)>> = HashMap::new();
+    for (sid, agg) in by_session {
+        by_project
+            .entry(agg.project_path.clone())
+            .or_default()
+            .push((sid, agg));
+    }
+
+    let mut projects: Vec<ReviewProject> = by_project
+        .into_iter()
+        .map(|(project_path, sessions)| {
+            let project_name = std::path::Path::new(&project_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| project_path.clone());
+
+            let mut session_count = 0;
+            let mut message_count = 0;
+            let mut first_activity = i64::MAX;
+            let mut last_activity = 0;
+            let mut agent_set: HashSet<String> = HashSet::new();
+            let mut branch_set: HashSet<String> = HashSet::new();
+
+            let mut out_sessions: Vec<ReviewSession> = sessions
+                .into_iter()
+                .map(|(sid, agg)| {
+                    session_count += 1;
+                    message_count += agg.message_count;
+                    first_activity = first_activity.min(agg.started_at);
+                    last_activity = last_activity.max(agg.last_activity);
+                    agent_set.insert(agg.agent_type.clone());
+
+                    let (first_prompt, sum, branch) =
+                        meta.get(&sid).cloned().unwrap_or((None, None, None));
+                    if let Some(ref b) = branch {
+                        branch_set.insert(b.clone());
+                    }
+
+                    ReviewSession {
+                        session_id: sid,
+                        agent_type: agg.agent_type,
+                        started_at: agg.started_at,
+                        last_activity: agg.last_activity,
+                        message_count: agg.message_count,
+                        first_prompt,
+                        summary: sum,
+                        git_branch: branch,
+                        key_prompts: agg.user_prompts,
+                        input_tokens: agg.input_tokens,
+                        output_tokens: agg.output_tokens,
+                        cache_creation_tokens: agg.cache_creation_tokens,
+                        cache_read_tokens: agg.cache_read_tokens,
+                    }
+                })
+                .collect();
+            out_sessions.sort_by_key(|s| s.started_at);
+
+            let mut agents_vec: Vec<String> = agent_set.into_iter().collect();
+            agents_vec.sort();
+            let mut branches_vec: Vec<String> = branch_set.into_iter().collect();
+            branches_vec.sort();
+
+            ReviewProject {
+                project_path,
+                project_name,
+                session_count,
+                message_count,
+                first_activity: if first_activity == i64::MAX {
+                    0
+                } else {
+                    first_activity
+                },
+                last_activity,
+                agents: agents_vec,
+                branches: branches_vec,
+                sessions: out_sessions,
+            }
+        })
+        .collect();
+
+    projects.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+    summary.projects = projects;
+
+    Ok(summary)
 }
 
 /// Rebuild daily_activity table from history table

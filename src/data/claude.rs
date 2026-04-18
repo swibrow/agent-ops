@@ -20,9 +20,9 @@ pub struct SessionIndexEntry {
     #[serde(rename = "sessionId")]
     pub session_id: String,
     #[serde(default)]
-    pub created: Option<i64>,
+    pub created: Option<String>,
     #[serde(default)]
-    pub modified: Option<i64>,
+    pub modified: Option<String>,
     #[serde(rename = "firstPrompt", default)]
     pub first_prompt: Option<String>,
     #[serde(default)]
@@ -31,6 +31,13 @@ pub struct SessionIndexEntry {
     pub message_count: Option<u32>,
     #[serde(rename = "gitBranch", default)]
     pub git_branch: Option<String>,
+}
+
+/// Wrapper format: { version, entries: [...] }
+#[derive(Debug, Deserialize)]
+struct SessionIndexFile {
+    #[serde(default)]
+    entries: Vec<SessionIndexEntry>,
 }
 
 /// Read all active session files from ~/.claude/sessions/
@@ -94,7 +101,11 @@ pub fn read_project_sessions(claude_dir: &Path) -> Result<Vec<(String, Vec<Sessi
 
         match std::fs::read_to_string(&index_path) {
             Ok(content) => {
-                if let Ok(entries) = serde_json::from_str::<Vec<SessionIndexEntry>>(&content) {
+                // Try wrapper format first: { version, entries: [...] }
+                if let Ok(index_file) = serde_json::from_str::<SessionIndexFile>(&content) {
+                    all_projects.push((project_path, index_file.entries));
+                } else if let Ok(entries) = serde_json::from_str::<Vec<SessionIndexEntry>>(&content) {
+                    // Fallback: bare array
                     all_projects.push((project_path, entries));
                 }
             }
@@ -346,7 +357,7 @@ mod tests {
         let project_dir = dir.path().join("projects").join("-Users-me-dev-myproject");
         std::fs::create_dir_all(&project_dir).unwrap();
 
-        let index_json = r#"[{"sessionId": "s1", "created": 100, "modified": 200, "firstPrompt": "hello", "messageCount": 5}]"#;
+        let index_json = r#"[{"sessionId": "s1", "created": "2026-01-01T00:00:00Z", "modified": "2026-01-02T00:00:00Z", "firstPrompt": "hello", "messageCount": 5}]"#;
         std::fs::write(project_dir.join("sessions-index.json"), index_json).unwrap();
 
         let projects = read_project_sessions(dir.path()).unwrap();

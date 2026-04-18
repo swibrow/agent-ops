@@ -9,6 +9,7 @@ use crate::db::queries;
 use crate::event::action::Action;
 use crate::model::history::HistoryEntry;
 use crate::model::project::{Project, ProjectSort, StalenessLevel};
+use crate::model::review::{ReviewRange, ReviewSummary};
 use crate::model::session::AgentSession;
 use crate::model::session::AgentType;
 
@@ -17,13 +18,15 @@ pub enum ActiveView {
     Dashboard,
     Projects,
     History,
+    Review,
 }
 
 impl ActiveView {
     pub fn next(&self) -> Self {
         match self {
             Self::Dashboard => Self::Projects,
-            Self::Projects => Self::History,
+            Self::Projects => Self::Review,
+            Self::Review => Self::History,
             Self::History => Self::Dashboard,
         }
     }
@@ -32,7 +35,8 @@ impl ActiveView {
         match self {
             Self::Dashboard => Self::History,
             Self::Projects => Self::Dashboard,
-            Self::History => Self::Projects,
+            Self::Review => Self::Projects,
+            Self::History => Self::Review,
         }
     }
 }
@@ -74,6 +78,14 @@ pub struct App {
     pub history_selected: usize,
     pub history_scroll: usize,
     pub history_filter_project: Option<String>,
+
+    // Review state
+    pub review_range: ReviewRange,
+    pub review_summary: Option<ReviewSummary>,
+    pub review_selected: usize,
+    pub review_scroll: usize,
+    pub review_dirty: bool,
+    pub review_expanded: std::collections::HashSet<String>,
 
     // Overlays
     pub show_detail: bool,
@@ -120,6 +132,12 @@ impl App {
             history_selected: 0,
             history_scroll: 0,
             history_filter_project: None,
+            review_range: ReviewRange::LastDay,
+            review_summary: None,
+            review_selected: 0,
+            review_scroll: 0,
+            review_dirty: true,
+            review_expanded: std::collections::HashSet::new(),
             show_detail: false,
             show_help: false,
             show_quit_confirm: false,
@@ -138,6 +156,9 @@ impl App {
             Action::RequestQuit => self.show_quit_confirm = true,
             Action::CancelQuit => self.show_quit_confirm = false,
             Action::SwitchTab(view) => {
+                if view == ActiveView::Review && self.active_view != ActiveView::Review {
+                    self.review_dirty = true;
+                }
                 self.active_view = view;
                 self.show_detail = false;
                 self.pane_preview = None;
@@ -146,11 +167,17 @@ impl App {
                 self.active_view = self.active_view.next();
                 self.show_detail = false;
                 self.pane_preview = None;
+                if self.active_view == ActiveView::Review {
+                    self.review_dirty = true;
+                }
             }
             Action::PrevTab => {
                 self.active_view = self.active_view.prev();
                 self.show_detail = false;
                 self.pane_preview = None;
+                if self.active_view == ActiveView::Review {
+                    self.review_dirty = true;
+                }
             }
             Action::SelectNext => self.select_next(),
             Action::SelectPrev => self.select_prev(),
@@ -241,8 +268,57 @@ impl App {
                     self.status_message = None;
                 }
             }
-            Action::Refresh | Action::DataRefreshed | Action::None => {}
+            Action::CycleReviewRange => {
+                self.review_range = self.review_range.next();
+                self.review_dirty = true;
+                self.review_expanded.clear();
+                self.review_selected = 0;
+                self.review_scroll = 0;
+            }
+            Action::CycleReviewRangeBack => {
+                self.review_range = self.review_range.prev();
+                self.review_dirty = true;
+                self.review_expanded.clear();
+                self.review_selected = 0;
+                self.review_scroll = 0;
+            }
+            Action::ToggleReviewExpand => {
+                if let Some(summary) = &self.review_summary {
+                    if let Some(project) = summary.projects.get(self.review_selected) {
+                        let key = project.project_path.clone();
+                        if self.review_expanded.contains(&key) {
+                            self.review_expanded.remove(&key);
+                        } else {
+                            self.review_expanded.insert(key);
+                        }
+                    }
+                }
+            }
+            Action::Refresh => {
+                self.review_dirty = true;
+            }
+            Action::DataRefreshed | Action::None => {}
         }
+    }
+
+    /// Load the review summary for the current range from the DB.
+    /// Sets `review_dirty = false`. Safe to call on every frame — cheap when
+    /// nothing's changed because the caller guards it with `review_dirty`.
+    pub fn load_review(&mut self, conn: &Connection) {
+        let now = chrono::Utc::now().timestamp_millis();
+        let from = now - self.review_range.millis();
+        match queries::build_review(conn, from, now, None, 5) {
+            Ok(summary) => {
+                self.review_summary = Some(summary);
+                self.review_selected = 0;
+                self.review_scroll = 0;
+            }
+            Err(e) => {
+                warn!(error = %e, "build_review failed");
+                self.last_error = Some(format!("Review query failed: {e}"));
+            }
+        }
+        self.review_dirty = false;
     }
 
     pub fn refresh_from_db(&mut self, conn: &Connection) {
@@ -308,6 +384,9 @@ impl App {
 
         self.sort_projects();
         self.filter_projects();
+
+        // New data may have landed; refresh review next time it's visible
+        self.review_dirty = true;
     }
 
     pub fn apply_sync_result(&mut self, result: &SyncResult) {
@@ -337,6 +416,7 @@ impl App {
                         || s.project_path == entry.project
                 })
             }
+            ActiveView::Review => None,
         }
     }
 
@@ -364,6 +444,16 @@ impl App {
                     self.adjust_history_scroll();
                 }
             }
+            ActiveView::Review => {
+                let total = self.review_summary
+                    .as_ref()
+                    .map(|s| s.projects.len())
+                    .unwrap_or(0);
+                if self.review_selected < total.saturating_sub(1) {
+                    self.review_selected += 1;
+                    self.adjust_review_scroll();
+                }
+            }
         }
     }
 
@@ -380,6 +470,10 @@ impl App {
             ActiveView::History => {
                 self.history_selected = self.history_selected.saturating_sub(1);
                 self.adjust_history_scroll();
+            }
+            ActiveView::Review => {
+                self.review_selected = self.review_selected.saturating_sub(1);
+                self.adjust_review_scroll();
             }
         }
     }
@@ -398,6 +492,10 @@ impl App {
                 self.history_selected = 0;
                 self.history_scroll = 0;
             }
+            ActiveView::Review => {
+                self.review_selected = 0;
+                self.review_scroll = 0;
+            }
         }
     }
 
@@ -410,6 +508,14 @@ impl App {
             ActiveView::Projects => {
                 self.project_selected = self.filtered_projects.len().saturating_sub(1);
                 self.adjust_project_scroll();
+            }
+            ActiveView::Review => {
+                let total = self.review_summary
+                    .as_ref()
+                    .map(|s| s.projects.len())
+                    .unwrap_or(0);
+                self.review_selected = total.saturating_sub(1);
+                self.adjust_review_scroll();
             }
             ActiveView::History => {
                 self.history_selected = self.history_entries.len().saturating_sub(1);
@@ -442,6 +548,15 @@ impl App {
             self.history_scroll = self.history_selected;
         } else if self.history_selected >= self.history_scroll + visible {
             self.history_scroll = self.history_selected - visible + 1;
+        }
+    }
+
+    fn adjust_review_scroll(&mut self) {
+        let visible = 10;
+        if self.review_selected < self.review_scroll {
+            self.review_scroll = self.review_selected;
+        } else if self.review_selected >= self.review_scroll + visible {
+            self.review_scroll = self.review_selected - visible + 1;
         }
     }
 

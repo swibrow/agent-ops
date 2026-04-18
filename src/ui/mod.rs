@@ -2,6 +2,7 @@ pub mod dashboard;
 pub mod details;
 pub mod history;
 pub mod projects;
+pub mod review;
 pub mod widgets;
 
 use ratatui::prelude::*;
@@ -44,6 +45,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     match app.active_view {
         ActiveView::Dashboard => dashboard::draw(frame, layout[1], app),
         ActiveView::Projects => projects::draw(frame, layout[1], app),
+        ActiveView::Review => review::draw(frame, layout[1], app),
         ActiveView::History => history::draw(frame, layout[1], app),
     }
 
