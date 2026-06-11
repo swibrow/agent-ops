@@ -9,10 +9,10 @@ mod tui;
 mod ui;
 mod web;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::Parser;
@@ -277,14 +277,8 @@ async fn main() -> Result<()> {
     // Notification tracker
     let mut notifier = NotificationTracker::new(config.notifications_enabled);
 
-    // Track which tmux windows we've renamed so we can reset them on shutdown
-    let mut renamed_windows: HashSet<String> = HashSet::new();
-
-    // Track per-window activity from last sync cycle to detect transitions.
-    let mut prev_window_activities: HashMap<String, AgentActivity> = HashMap::new();
-    // Windows showing ✅ (completed) and when they completed.
-    let mut completed_windows: HashMap<String, Instant> = HashMap::new();
-    let completed_expiry = Duration::from_secs(600); // 10 minutes
+    // Tmux window title icons (🔔 💬 ⏳ …) — owns all cross-cycle rename state.
+    let mut title_manager = data::window_titles::TitleManager::new();
 
     // Initialize terminal
     let mut terminal = tui::init()?;
@@ -322,119 +316,7 @@ async fn main() -> Result<()> {
                             &result.active_session_ids,
                         );
 
-                        // Build per-window activity states from gathered pane data.
-                        // Multiple panes can share a window — pick the highest priority.
-                        let mut window_activities: HashMap<String, AgentActivity> =
-                            HashMap::new();
-                        for pane in &data.agent_panes {
-                            let target = format!(
-                                "{}:{}",
-                                pane.tmux_ref.session_name, pane.tmux_ref.window_index
-                            );
-                            let activity = data
-                                .pane_activities
-                                .get(&pane.tmux_ref.pane_id)
-                                .cloned()
-                                .unwrap_or(pane.title_activity.clone());
-                            let entry = window_activities.entry(target).or_default();
-                            if activity.sort_priority() < entry.sort_priority() {
-                                *entry = activity;
-                            }
-                        }
-
-                        let now = Instant::now();
-
-                        // Detect completion transitions:
-                        // 1. Processing → WaitingForInput (agent finished work)
-                        // 2. Previously active window disappeared (agent exited)
-                        for (target, prev_activity) in &prev_window_activities {
-                            let cur_activity = window_activities.get(target);
-                            let just_completed = match (prev_activity, cur_activity) {
-                                // Agent was working, now idle → done
-                                (
-                                    AgentActivity::Processing,
-                                    Some(AgentActivity::WaitingForInput),
-                                ) => true,
-                                // Agent pane disappeared entirely → exited
-                                (AgentActivity::Processing, None) => true,
-                                (AgentActivity::WaitingForInput, None) => true,
-                                (AgentActivity::WaitingForPermission, None) => true,
-                                (AgentActivity::Unknown, None) => true,
-                                _ => false,
-                            };
-                            if just_completed && !completed_windows.contains_key(target) {
-                                completed_windows.insert(target.clone(), now);
-                            }
-                        }
-
-                        // If agent starts processing again, clear completed state
-                        for (target, activity) in &window_activities {
-                            if matches!(activity, AgentActivity::Processing) {
-                                completed_windows.remove(target);
-                            }
-                        }
-
-                        // Expire completed windows older than 10 minutes
-                        let expired: Vec<String> = completed_windows
-                            .iter()
-                            .filter(|(_, ts)| now.duration_since(**ts) >= completed_expiry)
-                            .map(|(t, _)| t.clone())
-                            .collect();
-                        if !expired.is_empty() {
-                            for t in &expired {
-                                completed_windows.remove(t);
-                            }
-                            // Reset icons for windows where agent exited (no longer in panes)
-                            let exited: Vec<String> = expired
-                                .iter()
-                                .filter(|t| !window_activities.contains_key(*t))
-                                .cloned()
-                                .collect();
-                            if !exited.is_empty() {
-                                if let Err(e) =
-                                    data::tmux::reset_agent_window_titles(&exited).await
-                                {
-                                    warn!(
-                                        error = %e,
-                                        "failed to reset expired completed windows"
-                                    );
-                                }
-                                for t in &exited {
-                                    renamed_windows.remove(t);
-                                }
-                            }
-                        }
-
-                        // Override activity to Completed for windows in the completed set
-                        for (target, _) in &completed_windows {
-                            window_activities
-                                .insert(target.clone(), AgentActivity::Completed);
-                        }
-
-                        // Save current activities for next cycle's transition detection
-                        prev_window_activities = window_activities
-                            .iter()
-                            .filter(|(_, a)| !matches!(a, AgentActivity::Completed))
-                            .map(|(t, a): (&String, &AgentActivity)| (t.clone(), a.clone()))
-                            .collect();
-                        // Also remember windows that disappeared so we can detect exits
-                        // (prev_window_activities already excludes completed overrides)
-
-                        let window_states: Vec<data::tmux::AgentWindowState> = window_activities
-                            .into_iter()
-                            .map(|(target, activity)| data::tmux::AgentWindowState {
-                                target,
-                                activity,
-                            })
-                            .collect();
-
-                        // Remember which windows we've touched
-                        for ws in &window_states {
-                            renamed_windows.insert(ws.target.clone());
-                        }
-
-                        if let Err(e) = data::tmux::update_agent_window_titles(&window_states).await
-                        {
+                        if let Err(e) = title_manager.apply(&data).await {
                             warn!(error = %e, "failed to update tmux window titles");
                         }
 
@@ -464,12 +346,27 @@ async fn main() -> Result<()> {
             app.apply_action(Action::Tick);
         }
 
-        if app.show_detail && app.pane_preview.is_none() {
-            if let Some(session) = app.selected_session() {
-                if let Some(ref pane) = session.tmux_pane {
-                    let pane_id = pane.pane_id.clone();
-                    if let Ok(preview) = data::tmux::capture_pane(&pane_id, 10).await {
-                        app.pane_preview = Some(preview);
+        // Execute side effects queued by apply_action (pane actions, resume,
+        // clipboard, editor) — key handling itself never does I/O.
+        let commands: Vec<app::AppCommand> = app.pending_commands.drain(..).collect();
+        for command in commands {
+            execute_app_command(&mut app, &registry, command).await;
+        }
+
+        // Load the pane capture for the detail / preview overlays. The live
+        // preview refreshes every ~10 ticks (500ms) so it follows the agent.
+        if app.show_detail || app.show_preview {
+            let stale = app.pane_preview.is_none()
+                || (app.show_preview && app.tick_count.is_multiple_of(10));
+            if stale {
+                if let Some(session) = app.selected_session() {
+                    if let Some(ref pane) = session.tmux_pane {
+                        let pane_id = pane.pane_id.clone();
+                        if let Ok(preview) =
+                            data::tmux::capture_pane_colored(&pane_id, 100).await
+                        {
+                            app.pane_preview = Some(preview);
+                        }
                     }
                 }
             }
@@ -482,15 +379,199 @@ async fn main() -> Result<()> {
 
     tui::restore()?;
 
-    // Reset all agent tmux windows back to automatic naming
-    let targets: Vec<String> = renamed_windows.into_iter().collect();
-    if let Err(e) = data::tmux::reset_agent_window_titles(&targets).await {
+    // Restore all agent tmux window titles (and their automatic-rename setting)
+    if let Err(e) = title_manager.reset_all().await {
         warn!(error = %e, "failed to reset tmux window titles on shutdown");
     }
 
     info!("agent-ops shutdown");
 
     Ok(())
+}
+
+/// Execute a side effect queued by `apply_action`.
+async fn execute_app_command(app: &mut App, registry: &AgentRegistry, command: app::AppCommand) {
+    use crate::app::AppCommand;
+
+    match command {
+        AppCommand::Pane(req) => execute_pane_request(app, registry, req).await,
+        AppCommand::Resume(session) => execute_resume(app, registry, *session).await,
+        AppCommand::CopyToClipboard(text) => execute_copy(app, text).await,
+        AppCommand::OpenEditor { name, path } => execute_open_editor(app, name, path),
+    }
+}
+
+/// Jump to a session's live tmux pane, or resume a detached session in a new
+/// window. Pane-id targets are stable — tmux resolves the containing window
+/// and session from them, so this survives window moves and renumbering.
+async fn execute_resume(app: &mut App, registry: &AgentRegistry, session: model::session::AgentSession) {
+    let result = if let Some(pane) = &session.tmux_pane {
+        let mut commands: Vec<Vec<String>> = vec![
+            vec![
+                "select-pane".to_string(),
+                "-t".to_string(),
+                pane.pane_id.clone(),
+            ],
+            vec![
+                "select-window".to_string(),
+                "-t".to_string(),
+                pane.pane_id.clone(),
+            ],
+        ];
+        // Only a client running inside tmux can be switched; outside, the
+        // select calls still mark the window/pane current for the next attach.
+        if std::env::var_os("TMUX").is_some() {
+            commands.push(vec![
+                "switch-client".to_string(),
+                "-t".to_string(),
+                pane.pane_id.clone(),
+            ]);
+        }
+        data::tmux::run_chained(&commands)
+            .await
+            .map(|()| format!("Jumped to {}", session.project_name))
+    } else {
+        let resume_cmd = registry
+            .provider_for(session.agent_type)
+            .and_then(|p| p.resume_command(&session.session_id));
+        match resume_cmd {
+            Some(resume_cmd) => {
+                let mut cmd = vec![
+                    "new-window".to_string(),
+                    "-n".to_string(),
+                    session.project_name.clone(),
+                    "-c".to_string(),
+                    session.project_path.clone(),
+                ];
+                cmd.extend(resume_cmd);
+                data::tmux::run_chained(&[cmd])
+                    .await
+                    .map(|()| format!("Resumed: {}", session.project_name))
+            }
+            None => {
+                app.status_message = Some(format!(
+                    "Resume not supported for {}",
+                    session.agent_type.label()
+                ));
+                return;
+            }
+        }
+    };
+
+    match result {
+        Ok(message) => {
+            info!(session_id = session.session_id, "resumed session");
+            app.status_message = Some(message);
+        }
+        Err(e) => {
+            warn!(error = %e, session_id = session.session_id, "resume failed");
+            app.last_error = Some(format!("Resume failed: {e}"));
+        }
+    }
+}
+
+async fn execute_copy(app: &mut App, text: String) {
+    use tokio::io::AsyncWriteExt;
+
+    let result = async {
+        let mut child = tokio::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(text.as_bytes()).await?;
+        }
+        child.wait().await?;
+        anyhow::Ok(())
+    }
+    .await;
+
+    match result {
+        Ok(()) => app.status_message = Some(format!("Copied: {text}")),
+        Err(e) => {
+            warn!(error = %e, "failed to copy to clipboard");
+            app.last_error = Some("Failed to copy to clipboard".to_string());
+        }
+    }
+}
+
+fn execute_open_editor(app: &mut App, name: String, path: String) {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "code".to_string());
+    match std::process::Command::new(&editor).arg(&path).spawn() {
+        Ok(_) => {
+            app.status_message = Some(format!("Opened {name} in {editor}"));
+        }
+        Err(e) => {
+            warn!(error = %e, editor, "failed to open editor");
+            app.last_error = Some(format!("Failed to open {editor}: {e}"));
+        }
+    }
+}
+
+/// Deliver a queued pane action via tmux send-keys and reflect the outcome
+/// in the UI immediately, ahead of the next sync cycle.
+async fn execute_pane_request(app: &mut App, registry: &AgentRegistry, req: app::PaneRequest) {
+    use crate::app::PaneCommand;
+
+    let provider = registry.provider_for(req.agent_type);
+    let result = match &req.command {
+        PaneCommand::Approve => {
+            let keys = provider
+                .map(|p| p.approve_keys())
+                .unwrap_or_else(|| vec!["1".to_string()]);
+            data::tmux::send_keys(&req.pane_id, &keys).await
+        }
+        PaneCommand::Deny => {
+            let keys = provider
+                .map(|p| p.deny_keys())
+                .unwrap_or_else(|| vec!["Escape".to_string()]);
+            data::tmux::send_keys(&req.pane_id, &keys).await
+        }
+        PaneCommand::SendText(text) => data::tmux::send_text(&req.pane_id, text).await,
+    };
+
+    match result {
+        Ok(()) => {
+            let (message, new_activity) = match &req.command {
+                PaneCommand::Approve => (
+                    format!("Approved: {}", req.project_name),
+                    AgentActivity::Processing,
+                ),
+                PaneCommand::Deny => (
+                    format!("Denied: {}", req.project_name),
+                    AgentActivity::WaitingForInput,
+                ),
+                PaneCommand::SendText(_) => (
+                    format!("Sent prompt to {}", req.project_name),
+                    AgentActivity::Processing,
+                ),
+            };
+            info!(
+                session_id = req.session_id,
+                pane_id = req.pane_id,
+                command = ?req.command,
+                "executed pane action"
+            );
+            app.status_message = Some(message);
+
+            // Optimistic update so the dashboard reflects the action now;
+            // the next sync cycle confirms or corrects it.
+            app.activity_map
+                .insert(req.session_id.clone(), new_activity.clone());
+            for session in app
+                .active_sessions
+                .iter_mut()
+                .chain(app.all_sessions.iter_mut())
+            {
+                if session.session_id == req.session_id {
+                    session.activity = new_activity.clone();
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, pane_id = req.pane_id, "pane action failed");
+            app.last_error = Some(format!("Pane action failed: {e}"));
+        }
+    }
 }
 
 async fn run_file_watcher(

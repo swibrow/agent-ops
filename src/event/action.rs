@@ -39,5 +39,13 @@ pub enum Action {
     CycleReviewRange,
     CycleReviewRangeBack,
     ToggleReviewExpand,
+    // Pane interaction (approve/deny permission prompts, write text to agent)
+    ApprovePermission,
+    DenyPermission,
+    EnterPrompt,
+    PromptInput(char),
+    PromptBackspace,
+    SubmitPrompt,
+    CancelPrompt,
     None,
 }

@@ -1,6 +1,7 @@
 pub mod dashboard;
 pub mod details;
 pub mod history;
+pub mod preview;
 pub mod projects;
 pub mod review;
 pub mod widgets;
@@ -65,6 +66,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
         details::draw(frame, app);
     }
 
+    if app.show_preview {
+        preview::draw(frame, app);
+    }
+
+    if app.prompt_active {
+        draw_prompt_overlay(frame, area, app);
+    }
+
     if app.show_help {
         draw_help_overlay(frame, area);
     }
@@ -124,6 +133,49 @@ fn draw_status_bar(frame: &mut Frame, area: Rect, msg: &str) {
     frame.render_widget(paragraph, area);
 }
 
+fn draw_prompt_overlay(frame: &mut Frame, area: Rect, app: &App) {
+    let popup = centered_rect(60, 25, area);
+    frame.render_widget(Clear, popup);
+
+    let title = app
+        .prompt_target
+        .as_ref()
+        .map(|t| format!(" Send to {} ", t.project_name))
+        .unwrap_or_else(|| " Send to agent ".to_string());
+
+    let text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(" \u{276F} ", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(
+                app.prompt_buffer.as_str(),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled("█", Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  [Enter] ", Style::default().fg(Color::Yellow)),
+            Span::styled("Send", Style::default().fg(Color::DarkGray)),
+            Span::styled("  [Esc] ", Style::default().fg(Color::Yellow)),
+            Span::styled("Cancel", Style::default().fg(Color::DarkGray)),
+        ]),
+    ];
+
+    let paragraph = ratatui::widgets::Paragraph::new(text)
+        .wrap(ratatui::widgets::Wrap { trim: false })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title)
+                .title_style(Style::default().fg(Color::Cyan).bold())
+                .padding(Padding::new(1, 1, 0, 0)),
+        );
+
+    frame.render_widget(paragraph, popup);
+}
+
 fn draw_help_overlay(frame: &mut Frame, area: Rect) {
     let popup_area = centered_rect(60, 70, area);
     frame.render_widget(Clear, popup_area);
@@ -155,6 +207,18 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
             Span::raw("Resume session"),
         ]),
         Line::from(vec![
+            Span::styled("  a/d    ", Style::default().fg(Color::Yellow)),
+            Span::raw("Approve / deny permission prompt"),
+        ]),
+        Line::from(vec![
+            Span::styled("  i      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Write a prompt to the agent"),
+        ]),
+        Line::from(vec![
+            Span::styled("  A      ", Style::default().fg(Color::Yellow)),
+            Span::raw("Filter by agent type"),
+        ]),
+        Line::from(vec![
             Span::styled("  s      ", Style::default().fg(Color::Yellow)),
             Span::raw("Cycle sort (Projects)"),
         ]),
@@ -176,7 +240,7 @@ fn draw_help_overlay(frame: &mut Frame, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  Space  ", Style::default().fg(Color::Yellow)),
-            Span::raw("Toggle pane preview"),
+            Span::raw("Live pane preview"),
         ]),
         Line::from(vec![
             Span::styled("  R      ", Style::default().fg(Color::Yellow)),

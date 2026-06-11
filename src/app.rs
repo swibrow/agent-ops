@@ -1,5 +1,5 @@
 use rusqlite::Connection;
-use tracing::{info, warn};
+use tracing::warn;
 
 use std::collections::HashMap;
 
@@ -10,8 +10,47 @@ use crate::event::action::Action;
 use crate::model::history::HistoryEntry;
 use crate::model::project::{Project, ProjectSort, StalenessLevel};
 use crate::model::review::{ReviewRange, ReviewSummary};
+use crate::model::session::AgentActivity;
 use crate::model::session::AgentSession;
 use crate::model::session::AgentType;
+
+/// What to do to a live tmux pane. Queued by `apply_action` (which stays
+/// free of I/O) and executed asynchronously by the main loop.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PaneCommand {
+    Approve,
+    Deny,
+    SendText(String),
+}
+
+/// A side-effect request targeting a live agent pane.
+#[derive(Debug, Clone)]
+pub struct PaneRequest {
+    pub session_id: String,
+    pub pane_id: String,
+    pub agent_type: AgentType,
+    pub project_name: String,
+    pub command: PaneCommand,
+}
+
+/// Side effects queued by `apply_action` and executed by the main loop, so
+/// key handling never blocks on process spawning or tmux I/O.
+#[derive(Debug, Clone)]
+pub enum AppCommand {
+    Pane(PaneRequest),
+    Resume(Box<AgentSession>),
+    CopyToClipboard(String),
+    OpenEditor { name: String, path: String },
+}
+
+/// The pane a prompt-input overlay is writing to.
+#[derive(Debug, Clone)]
+pub struct PromptTarget {
+    pub session_id: String,
+    pub pane_id: String,
+    pub agent_type: AgentType,
+    pub project_name: String,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ActiveView {
@@ -91,11 +130,20 @@ pub struct App {
     pub show_detail: bool,
     pub show_help: bool,
     pub show_quit_confirm: bool,
+    pub show_preview: bool,
     pub pane_preview: Option<String>,
 
     // Search
     pub search_active: bool,
     pub search_query: String,
+
+    // Prompt input (write text back to an agent pane)
+    pub prompt_active: bool,
+    pub prompt_buffer: String,
+    pub prompt_target: Option<PromptTarget>,
+
+    // Side effects queued for the main loop to execute
+    pub pending_commands: Vec<AppCommand>,
 
     // Agent filter (None = show all, Some(type) = show only that type)
     pub agent_filter: Option<AgentType>,
@@ -141,9 +189,14 @@ impl App {
             show_detail: false,
             show_help: false,
             show_quit_confirm: false,
+            show_preview: false,
             pane_preview: None,
             search_active: false,
             search_query: String::new(),
+            prompt_active: false,
+            prompt_buffer: String::new(),
+            prompt_target: None,
+            pending_commands: Vec::new(),
             agent_filter: None,
             last_error: None,
             status_message: None,
@@ -161,11 +214,13 @@ impl App {
                 }
                 self.active_view = view;
                 self.show_detail = false;
+                self.show_preview = false;
                 self.pane_preview = None;
             }
             Action::NextTab => {
                 self.active_view = self.active_view.next();
                 self.show_detail = false;
+                self.show_preview = false;
                 self.pane_preview = None;
                 if self.active_view == ActiveView::Review {
                     self.review_dirty = true;
@@ -174,6 +229,7 @@ impl App {
             Action::PrevTab => {
                 self.active_view = self.active_view.prev();
                 self.show_detail = false;
+                self.show_preview = false;
                 self.pane_preview = None;
                 if self.active_view == ActiveView::Review {
                     self.review_dirty = true;
@@ -187,7 +243,8 @@ impl App {
                 self.show_detail = true;
             }
             Action::TogglePreview => {
-                self.pane_preview = None; // will be loaded on next tick
+                self.show_preview = !self.show_preview;
+                self.pane_preview = None; // reloaded by the main loop
             }
             Action::CycleSort => {
                 self.project_sort = self.project_sort.next();
@@ -226,11 +283,17 @@ impl App {
                 };
             }
             Action::ResumeSession => {
-                self.build_resume_command();
+                if let Some(session) = self.selected_session() {
+                    self.pending_commands
+                        .push(AppCommand::Resume(Box::new(session.clone())));
+                }
             }
             Action::CloseOverlay => {
                 if self.show_help {
                     self.show_help = false;
+                } else if self.show_preview {
+                    self.show_preview = false;
+                    self.pane_preview = None;
                 } else if self.show_detail {
                     self.show_detail = false;
                     self.pane_preview = None;
@@ -256,10 +319,43 @@ impl App {
                 self.filter_projects();
             }
             Action::CopySessionId => {
-                self.copy_session_id();
+                if let Some(session) = self.selected_session() {
+                    self.pending_commands
+                        .push(AppCommand::CopyToClipboard(session.session_id.clone()));
+                }
+            }
+            Action::ApprovePermission => {
+                self.queue_permission_response(PaneCommand::Approve);
+            }
+            Action::DenyPermission => {
+                self.queue_permission_response(PaneCommand::Deny);
+            }
+            Action::EnterPrompt => {
+                self.enter_prompt();
+            }
+            Action::PromptInput(c) => {
+                if self.prompt_active {
+                    self.prompt_buffer.push(c);
+                }
+            }
+            Action::PromptBackspace => {
+                self.prompt_buffer.pop();
+            }
+            Action::SubmitPrompt => {
+                self.submit_prompt();
+            }
+            Action::CancelPrompt => {
+                self.prompt_active = false;
+                self.prompt_buffer.clear();
+                self.prompt_target = None;
             }
             Action::OpenInEditor => {
-                self.open_in_editor();
+                if let Some(project) = self.selected_project() {
+                    self.pending_commands.push(AppCommand::OpenEditor {
+                        name: project.name.clone(),
+                        path: project.path.clone(),
+                    });
+                }
             }
             Action::Tick => {
                 self.tick_count += 1;
@@ -425,6 +521,9 @@ impl App {
     }
 
     fn select_next(&mut self) {
+        if self.show_preview {
+            self.pane_preview = None; // preview follows the selection
+        }
         match self.active_view {
             ActiveView::Dashboard => {
                 if self.dashboard_selected < self.active_sessions.len().saturating_sub(1) {
@@ -458,6 +557,9 @@ impl App {
     }
 
     fn select_prev(&mut self) {
+        if self.show_preview {
+            self.pane_preview = None; // preview follows the selection
+        }
         match self.active_view {
             ActiveView::Dashboard => {
                 self.dashboard_selected = self.dashboard_selected.saturating_sub(1);
@@ -597,107 +699,260 @@ impl App {
         }
     }
 
-    fn build_resume_command(&mut self) {
+    /// Queue an approve/deny for the selected session's permission prompt.
+    /// Gated on the session actually waiting for permission so a stray
+    /// keypress can't inject keys into a working agent.
+    fn queue_permission_response(&mut self, command: PaneCommand) {
         let session = match self.selected_session() {
             Some(s) => s.clone(),
             None => return,
         };
-
-        let commands: Vec<Vec<String>> = if let Some(ref pane) = session.tmux_pane {
-            vec![
-                vec![
-                    "tmux".to_string(),
-                    "select-window".to_string(),
-                    "-t".to_string(),
-                    format!("{}:{}", pane.session_name, pane.window_index),
-                ],
-                vec![
-                    "tmux".to_string(),
-                    "select-pane".to_string(),
-                    "-t".to_string(),
-                    pane.pane_id.clone(),
-                ],
-            ]
-        } else {
-            vec![vec![
-                "tmux".to_string(),
-                "new-window".to_string(),
-                "-n".to_string(),
-                session.project_name.clone(),
-                "-c".to_string(),
-                session.project_path.clone(),
-                "claude".to_string(),
-                "--resume".to_string(),
-                session.session_id.clone(),
-            ]]
-        };
-
-        for cmd in &commands {
-            if cmd.is_empty() {
-                continue;
-            }
-            match std::process::Command::new(&cmd[0]).args(&cmd[1..]).status() {
-                Ok(status) if !status.success() => {
-                    warn!(cmd = ?cmd, "tmux command failed");
-                    self.last_error = Some(format!("tmux command failed: {}", cmd.join(" ")));
-                }
-                Err(e) => {
-                    warn!(error = %e, "failed to execute tmux command");
-                    self.last_error = Some(format!("Failed to run tmux: {e}"));
-                }
-                _ => {
-                    info!(session_id = session.session_id, "resumed session");
-                    self.status_message = Some(format!("Resumed: {}", session.project_name));
-                }
-            }
-        }
-    }
-
-    fn copy_session_id(&mut self) {
-        let session = match self.selected_session() {
-            Some(s) => s,
-            None => return,
-        };
-
-        let session_id = session.session_id.clone();
-        match std::process::Command::new("pbcopy")
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(mut child) => {
-                if let Some(stdin) = child.stdin.take() {
-                    use std::io::Write;
-                    let mut stdin = stdin;
-                    let _ = stdin.write_all(session_id.as_bytes());
-                }
-                let _ = child.wait();
-                self.status_message = Some(format!("Copied: {session_id}"));
-            }
-            Err(e) => {
-                warn!(error = %e, "failed to copy to clipboard");
-                self.last_error = Some("Failed to copy to clipboard".to_string());
-            }
-        }
-    }
-
-    fn open_in_editor(&mut self) {
-        let project = match self.selected_project() {
+        let pane = match &session.tmux_pane {
             Some(p) => p.clone(),
+            None => {
+                self.status_message = Some("No live tmux pane for this session".to_string());
+                return;
+            }
+        };
+        if session.activity != AgentActivity::WaitingForPermission {
+            self.status_message = Some(format!(
+                "{} isn't waiting for permission",
+                session.project_name
+            ));
+            return;
+        }
+
+        self.pending_commands.push(AppCommand::Pane(PaneRequest {
+            session_id: session.session_id.clone(),
+            pane_id: pane.pane_id,
+            agent_type: session.agent_type,
+            project_name: session.project_name.clone(),
+            command,
+        }));
+    }
+
+    /// Open the prompt-input overlay targeting the selected session's pane.
+    fn enter_prompt(&mut self) {
+        let session = match self.selected_session() {
+            Some(s) => s.clone(),
             None => return,
         };
+        let pane = match &session.tmux_pane {
+            Some(p) => p.clone(),
+            None => {
+                self.status_message = Some("No live tmux pane for this session".to_string());
+                return;
+            }
+        };
 
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "code".to_string());
-        match std::process::Command::new(&editor)
-            .arg(&project.path)
-            .spawn()
-        {
-            Ok(_) => {
-                self.status_message = Some(format!("Opened {} in {editor}", project.name));
+        self.prompt_active = true;
+        self.prompt_buffer.clear();
+        self.prompt_target = Some(PromptTarget {
+            session_id: session.session_id.clone(),
+            pane_id: pane.pane_id,
+            agent_type: session.agent_type,
+            project_name: session.project_name.clone(),
+        });
+    }
+
+    /// Queue the typed prompt text for delivery to the target pane.
+    fn submit_prompt(&mut self) {
+        let target = match self.prompt_target.take() {
+            Some(t) => t,
+            None => {
+                self.prompt_active = false;
+                return;
             }
-            Err(e) => {
-                warn!(error = %e, editor, "failed to open editor");
-                self.last_error = Some(format!("Failed to open {editor}: {e}"));
-            }
+        };
+        let text = std::mem::take(&mut self.prompt_buffer);
+        self.prompt_active = false;
+
+        if text.trim().is_empty() {
+            return;
         }
+
+        self.pending_commands.push(AppCommand::Pane(PaneRequest {
+            session_id: target.session_id,
+            pane_id: target.pane_id,
+            agent_type: target.agent_type,
+            project_name: target.project_name,
+            command: PaneCommand::SendText(text),
+        }));
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::session::SessionStatus;
+    use crate::model::tmux::TmuxPaneRef;
+
+    fn session_with_pane(activity: AgentActivity) -> AgentSession {
+        AgentSession {
+            session_id: "s1".to_string(),
+            pid: Some(1),
+            agent_type: AgentType::Claude,
+            project_path: "/tmp/proj".to_string(),
+            project_name: "proj".to_string(),
+            started_at: 0,
+            ended_at: None,
+            status: SessionStatus::Active,
+            first_prompt: None,
+            summary: None,
+            git_branch: None,
+            message_count: 0,
+            last_activity: None,
+            tmux_pane: Some(TmuxPaneRef {
+                session_name: "main".to_string(),
+                window_index: 0,
+                pane_id: "%5".to_string(),
+            }),
+            pane_title: None,
+            activity,
+            cpu_percent: 0.0,
+            memory_mb: 0.0,
+        }
+    }
+
+    fn pane_request(command: &AppCommand) -> &PaneRequest {
+        match command {
+            AppCommand::Pane(req) => req,
+            other => panic!("expected pane command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn approve_queues_request_when_waiting_for_permission() {
+        let mut app = App::new();
+        app.active_sessions
+            .push(session_with_pane(AgentActivity::WaitingForPermission));
+
+        app.apply_action(Action::ApprovePermission);
+
+        assert_eq!(app.pending_commands.len(), 1);
+        let req = pane_request(&app.pending_commands[0]);
+        assert_eq!(req.pane_id, "%5");
+        assert_eq!(req.command, PaneCommand::Approve);
+    }
+
+    #[test]
+    fn approve_is_gated_on_permission_state() {
+        let mut app = App::new();
+        app.active_sessions
+            .push(session_with_pane(AgentActivity::Processing));
+
+        app.apply_action(Action::ApprovePermission);
+
+        assert!(app.pending_commands.is_empty());
+        assert!(app.status_message.is_some());
+    }
+
+    #[test]
+    fn deny_queues_request_when_waiting_for_permission() {
+        let mut app = App::new();
+        app.active_sessions
+            .push(session_with_pane(AgentActivity::WaitingForPermission));
+
+        app.apply_action(Action::DenyPermission);
+
+        assert_eq!(app.pending_commands.len(), 1);
+        assert_eq!(
+            pane_request(&app.pending_commands[0]).command,
+            PaneCommand::Deny
+        );
+    }
+
+    #[test]
+    fn prompt_flow_queues_send_text() {
+        let mut app = App::new();
+        app.active_sessions
+            .push(session_with_pane(AgentActivity::WaitingForInput));
+
+        app.apply_action(Action::EnterPrompt);
+        assert!(app.prompt_active);
+
+        for c in "fix the tests".chars() {
+            app.apply_action(Action::PromptInput(c));
+        }
+        app.apply_action(Action::SubmitPrompt);
+
+        assert!(!app.prompt_active);
+        assert_eq!(app.pending_commands.len(), 1);
+        assert_eq!(
+            pane_request(&app.pending_commands[0]).command,
+            PaneCommand::SendText("fix the tests".to_string())
+        );
+    }
+
+    #[test]
+    fn empty_prompt_is_not_sent() {
+        let mut app = App::new();
+        app.active_sessions
+            .push(session_with_pane(AgentActivity::WaitingForInput));
+
+        app.apply_action(Action::EnterPrompt);
+        app.apply_action(Action::SubmitPrompt);
+
+        assert!(!app.prompt_active);
+        assert!(app.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn cancel_prompt_clears_state() {
+        let mut app = App::new();
+        app.active_sessions
+            .push(session_with_pane(AgentActivity::WaitingForInput));
+
+        app.apply_action(Action::EnterPrompt);
+        app.apply_action(Action::PromptInput('x'));
+        app.apply_action(Action::CancelPrompt);
+
+        assert!(!app.prompt_active);
+        assert!(app.prompt_buffer.is_empty());
+        assert!(app.prompt_target.is_none());
+        assert!(app.pending_commands.is_empty());
+    }
+
+    #[test]
+    fn resume_queues_resume_command() {
+        let mut app = App::new();
+        app.active_sessions
+            .push(session_with_pane(AgentActivity::WaitingForInput));
+
+        app.apply_action(Action::ResumeSession);
+
+        assert_eq!(app.pending_commands.len(), 1);
+        assert!(matches!(
+            &app.pending_commands[0],
+            AppCommand::Resume(s) if s.session_id == "s1"
+        ));
+    }
+
+    #[test]
+    fn copy_queues_clipboard_command() {
+        let mut app = App::new();
+        app.active_sessions
+            .push(session_with_pane(AgentActivity::WaitingForInput));
+
+        app.apply_action(Action::CopySessionId);
+
+        assert!(matches!(
+            &app.pending_commands[0],
+            AppCommand::CopyToClipboard(text) if text == "s1"
+        ));
+    }
+
+    #[test]
+    fn prompt_without_pane_shows_status() {
+        let mut app = App::new();
+        let mut session = session_with_pane(AgentActivity::WaitingForInput);
+        session.tmux_pane = None;
+        app.active_sessions.push(session);
+
+        app.apply_action(Action::EnterPrompt);
+
+        assert!(!app.prompt_active);
+        assert!(app.status_message.is_some());
     }
 }

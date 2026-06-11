@@ -158,37 +158,57 @@ pub fn draw(frame: &mut Frame, app: &App) {
         ]));
     }
 
-    // Pane preview
+    // Pane preview: the tail of the pane (where the prompt/permission box
+    // lives), filling whatever vertical space is left in the popup.
     if let Some(preview) = &app.pane_preview {
+        // Rows still free: header/footer chrome around the preview box is
+        // 4 lines (blank, top rule, bottom rule, hint line at the end).
+        let avail = (inner.height as usize)
+            .saturating_sub(lines.len() + 4)
+            .max(3);
+        let rule_width = max_text_width.saturating_sub(4);
+
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  ┌─ Pane Preview ─────────────────────────────────┐",
+            format!(
+                "  ┌─ Pane Preview {}",
+                "─".repeat(rule_width.saturating_sub(17))
+            ),
             Style::default().fg(Color::DarkGray),
         )));
-        for preview_line in preview.lines().take(8) {
-            lines.push(Line::from(vec![
-                Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    time::truncate_to_width(preview_line, max_text_width.saturating_sub(8)),
-                    Style::default().fg(Color::Rgb(120, 120, 140)),
-                ),
-            ]));
+        let preview_text = crate::ui::preview::ansi_text(preview);
+        for preview_line in crate::ui::preview::tail(&preview_text.lines, avail) {
+            let mut spans = vec![Span::styled("  │ ", Style::default().fg(Color::DarkGray))];
+            spans.extend(preview_line.spans.iter().cloned());
+            lines.push(Line::from(spans));
         }
         lines.push(Line::from(Span::styled(
-            "  └────────────────────────────────────────────────┘",
+            format!("  └{}", "─".repeat(rule_width.saturating_sub(3))),
             Style::default().fg(Color::DarkGray),
         )));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(vec![
+    let mut hint_spans = vec![
         Span::styled("  [r] ", Style::default().fg(Color::Yellow)),
         Span::styled("Resume", Style::default().fg(Color::DarkGray)),
         Span::styled("  [y] ", Style::default().fg(Color::Yellow)),
         Span::styled("Copy ID", Style::default().fg(Color::DarkGray)),
-        Span::styled("  [Esc] ", Style::default().fg(Color::Yellow)),
-        Span::styled("Close", Style::default().fg(Color::DarkGray)),
-    ]));
+    ];
+    if session.tmux_pane.is_some() {
+        if session.activity == crate::model::session::AgentActivity::WaitingForPermission {
+            hint_spans.push(Span::styled("  [a] ", Style::default().fg(Color::Green)));
+            hint_spans.push(Span::styled("Approve", Style::default().fg(Color::DarkGray)));
+            hint_spans.push(Span::styled("  [d] ", Style::default().fg(Color::Red)));
+            hint_spans.push(Span::styled("Deny", Style::default().fg(Color::DarkGray)));
+        }
+        hint_spans.push(Span::styled("  [i] ", Style::default().fg(Color::Yellow)));
+        hint_spans.push(Span::styled("Write", Style::default().fg(Color::DarkGray)));
+    }
+    hint_spans.push(Span::styled("  [Esc] ", Style::default().fg(Color::Yellow)));
+    hint_spans.push(Span::styled("Close", Style::default().fg(Color::DarkGray)));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(hint_spans));
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner);

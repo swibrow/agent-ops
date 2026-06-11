@@ -4,6 +4,11 @@ use crate::app::{ActiveView, App};
 use crate::event::action::Action;
 
 pub fn handle_key_event(key: KeyEvent, app: &App) -> Action {
+    // If the prompt-input overlay is active, it captures all keys
+    if app.prompt_active {
+        return handle_prompt_key(key);
+    }
+
     // If search is active, handle text input
     if app.search_active {
         return handle_search_key(key);
@@ -37,12 +42,29 @@ pub fn handle_key_event(key: KeyEvent, app: &App) -> Action {
         return Action::CloseOverlay;
     }
 
+    // If the live pane preview is showing
+    if app.show_preview {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Char(' ') => Action::CloseOverlay,
+            KeyCode::Char('j') | KeyCode::Down => Action::SelectNext,
+            KeyCode::Char('k') | KeyCode::Up => Action::SelectPrev,
+            KeyCode::Char('a') => Action::ApprovePermission,
+            KeyCode::Char('d') => Action::DenyPermission,
+            KeyCode::Char('i') => Action::EnterPrompt,
+            KeyCode::Char('r') => Action::ResumeSession,
+            _ => Action::None,
+        };
+    }
+
     // If detail overlay is showing
     if app.show_detail {
         return match key.code {
             KeyCode::Esc => Action::CloseOverlay,
             KeyCode::Char('r') => Action::ResumeSession,
             KeyCode::Char('y') => Action::CopySessionId,
+            KeyCode::Char('a') => Action::ApprovePermission,
+            KeyCode::Char('d') => Action::DenyPermission,
+            KeyCode::Char('i') => Action::EnterPrompt,
             _ => Action::None,
         };
     }
@@ -77,7 +99,10 @@ pub fn handle_key_event(key: KeyEvent, app: &App) -> Action {
             _ => Action::None,
         },
         KeyCode::Char('F') => Action::ClearFilter,
-        KeyCode::Char('a') => Action::CycleAgentFilter,
+        KeyCode::Char('a') => Action::ApprovePermission,
+        KeyCode::Char('d') => Action::DenyPermission,
+        KeyCode::Char('i') => Action::EnterPrompt,
+        KeyCode::Char('A') => Action::CycleAgentFilter,
         KeyCode::Char('e') => match app.active_view {
             ActiveView::Projects => Action::OpenInEditor,
             _ => Action::None,
@@ -93,6 +118,16 @@ fn handle_search_key(key: KeyEvent) -> Action {
         KeyCode::Enter => Action::ExitSearch,
         KeyCode::Backspace => Action::SearchBackspace,
         KeyCode::Char(c) => Action::SearchInput(c),
+        _ => Action::None,
+    }
+}
+
+fn handle_prompt_key(key: KeyEvent) -> Action {
+    match key.code {
+        KeyCode::Esc => Action::CancelPrompt,
+        KeyCode::Enter => Action::SubmitPrompt,
+        KeyCode::Backspace => Action::PromptBackspace,
+        KeyCode::Char(c) => Action::PromptInput(c),
         _ => Action::None,
     }
 }
@@ -515,6 +550,149 @@ mod tests {
         assert_eq!(
             handle_key_event(key(KeyCode::Char('x')), &app),
             Action::None,
+        );
+    }
+
+    // ── Pane actions ─────────────────────────────────────────────
+
+    #[test]
+    fn a_produces_approve_permission() {
+        let app = default_app();
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('a')), &app),
+            Action::ApprovePermission,
+        );
+    }
+
+    #[test]
+    fn d_produces_deny_permission() {
+        let app = default_app();
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('d')), &app),
+            Action::DenyPermission,
+        );
+    }
+
+    #[test]
+    fn i_produces_enter_prompt() {
+        let app = default_app();
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('i')), &app),
+            Action::EnterPrompt,
+        );
+    }
+
+    #[test]
+    fn big_a_cycles_agent_filter() {
+        let app = default_app();
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('A')), &app),
+            Action::CycleAgentFilter,
+        );
+    }
+
+    #[test]
+    fn a_on_detail_overlay_produces_approve() {
+        let mut app = default_app();
+        app.show_detail = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('a')), &app),
+            Action::ApprovePermission,
+        );
+    }
+
+    #[test]
+    fn i_on_detail_overlay_produces_enter_prompt() {
+        let mut app = default_app();
+        app.show_detail = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('i')), &app),
+            Action::EnterPrompt,
+        );
+    }
+
+    // ── Preview overlay ──────────────────────────────────────────
+
+    #[test]
+    fn space_toggles_preview_overlay() {
+        let app = default_app();
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char(' ')), &app),
+            Action::TogglePreview,
+        );
+    }
+
+    #[test]
+    fn space_closes_preview_overlay() {
+        let mut app = default_app();
+        app.show_preview = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char(' ')), &app),
+            Action::CloseOverlay,
+        );
+        assert_eq!(
+            handle_key_event(key(KeyCode::Esc), &app),
+            Action::CloseOverlay,
+        );
+    }
+
+    #[test]
+    fn preview_overlay_allows_navigation_and_actions() {
+        let mut app = default_app();
+        app.show_preview = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('j')), &app),
+            Action::SelectNext,
+        );
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('a')), &app),
+            Action::ApprovePermission,
+        );
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('i')), &app),
+            Action::EnterPrompt,
+        );
+    }
+
+    // ── Prompt input mode ────────────────────────────────────────
+
+    #[test]
+    fn prompt_active_chars_produce_prompt_input() {
+        let mut app = default_app();
+        app.prompt_active = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Char('q')), &app),
+            Action::PromptInput('q'),
+        );
+    }
+
+    #[test]
+    fn prompt_active_enter_submits() {
+        let mut app = default_app();
+        app.prompt_active = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Enter), &app),
+            Action::SubmitPrompt,
+        );
+    }
+
+    #[test]
+    fn prompt_active_esc_cancels() {
+        let mut app = default_app();
+        app.prompt_active = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Esc), &app),
+            Action::CancelPrompt,
+        );
+    }
+
+    #[test]
+    fn prompt_active_backspace_produces_prompt_backspace() {
+        let mut app = default_app();
+        app.prompt_active = true;
+        assert_eq!(
+            handle_key_event(key(KeyCode::Backspace), &app),
+            Action::PromptBackspace,
         );
     }
 }

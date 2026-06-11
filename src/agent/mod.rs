@@ -68,6 +68,23 @@ pub trait AgentProvider: Send + Sync {
     fn ingest_transcripts(&self, _config: &Config, _conn: &Connection) -> Result<usize> {
         Ok(0)
     }
+
+    /// Key names (tmux send-keys syntax) that approve a pending permission
+    /// prompt. Default: "1" selects the first ("Yes") option in a numbered menu.
+    fn approve_keys(&self) -> Vec<String> {
+        vec!["1".to_string()]
+    }
+
+    /// Key names that dismiss a pending permission prompt without approving.
+    fn deny_keys(&self) -> Vec<String> {
+        vec!["Escape".to_string()]
+    }
+
+    /// Command argv that resumes a detached session by id in a fresh window.
+    /// None if this agent can't resume sessions by id.
+    fn resume_command(&self, _session_id: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Known shell commands — panes running these are pre-filtered before
@@ -120,6 +137,14 @@ impl AgentRegistry {
     /// Get all registered providers.
     pub fn providers(&self) -> &[Box<dyn AgentProvider>] {
         &self.providers
+    }
+
+    /// Look up the provider for a given agent type.
+    pub fn provider_for(&self, agent_type: AgentType) -> Option<&dyn AgentProvider> {
+        self.providers
+            .iter()
+            .find(|p| p.agent_type() == agent_type)
+            .map(|p| p.as_ref())
     }
 }
 

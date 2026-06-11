@@ -32,6 +32,17 @@ pub struct GatheredData {
     pub pane_activities: HashMap<String, AgentActivity>,
 }
 
+impl GatheredData {
+    /// Final activity for a pane: the refined (pane-content) result when
+    /// available, falling back to the title-based detection.
+    pub fn activity_for(&self, pane: &tmux::AgentPaneInfo) -> AgentActivity {
+        self.pane_activities
+            .get(&pane.tmux_ref.pane_id)
+            .cloned()
+            .unwrap_or_else(|| pane.title_activity.clone())
+    }
+}
+
 /// Gather all data from async sources (tmux, filesystem, ps).
 /// Uses the registry to detect agents across all providers.
 pub async fn gather_data(config: &Config, registry: &AgentRegistry) -> Result<GatheredData> {
@@ -40,16 +51,18 @@ pub async fn gather_data(config: &Config, registry: &AgentRegistry) -> Result<Ga
 
     // Step 2: Detect agents using the registry
     let mut agent_panes = Vec::new();
-    for (session_name, window_index, pane) in &all_panes {
+    for listing in &all_panes {
+        let pane = &listing.pane;
         if let Some(provider) = registry.detect(pane) {
             let activity = provider.detect_activity(pane);
             let title = provider.clean_title(&pane.title).to_string();
             agent_panes.push(tmux::AgentPaneInfo {
                 tmux_ref: TmuxPaneRef {
-                    session_name: session_name.clone(),
-                    window_index: *window_index,
+                    session_name: listing.session_name.clone(),
+                    window_index: listing.window_index,
                     pane_id: pane.id.clone(),
                 },
+                window_id: listing.window_id.clone(),
                 pid: pane.pid,
                 title,
                 current_path: pane.current_path.clone(),
@@ -150,11 +163,7 @@ pub fn apply_to_db(conn: &Connection, data: &GatheredData) -> Result<SyncResult>
     let mut claimed_session_ids: Vec<String> = Vec::new();
 
     for pane in &data.agent_panes {
-        let activity = data
-            .pane_activities
-            .get(&pane.tmux_ref.pane_id)
-            .cloned()
-            .unwrap_or(pane.title_activity.clone());
+        let activity = data.activity_for(pane);
 
         let matched_session = find_session_for_pane(
             pane,

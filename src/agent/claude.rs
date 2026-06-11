@@ -97,7 +97,7 @@ impl AgentProvider for ClaudeProvider {
                 return AgentActivity::Processing;
             }
 
-            let content = match tmux::capture_pane(&pane_id, 15).await {
+            let content = match tmux::capture_pane(&pane_id, 20).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(pane_id, error = %e, "failed to capture pane content");
@@ -105,8 +105,7 @@ impl AgentProvider for ClaudeProvider {
                 }
             };
 
-            let last_lines: Vec<&str> = content.lines().rev().take(30).collect();
-            let has_permission = last_lines.iter().any(|line| {
+            let has_permission = content.lines().any(|line| {
                 let trimmed = line.trim();
                 // Explicit permission prompts
                 trimmed.contains("Do you want to proceed?")
@@ -139,6 +138,14 @@ impl AgentProvider for ClaudeProvider {
 
     fn ingest_transcripts(&self, config: &Config, conn: &Connection) -> Result<usize> {
         transcripts::ingest_all_claude_dirs(conn, &config.claude_dirs)
+    }
+
+    fn resume_command(&self, session_id: &str) -> Option<Vec<String>> {
+        Some(vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            session_id.to_string(),
+        ])
     }
 }
 
