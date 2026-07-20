@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.5.0](https://github.com/swibrow/agent-ops/compare/v0.4.0...v0.5.0) (2026-07-20)
+
+
+### Features
+
+* multi-dir Claude support, completed state, and smart notifications ([a41db74](https://github.com/swibrow/agent-ops/commit/a41db741b4db5e4356fa1d933003604ea07a356a))
+* pane actions, live colored preview, and tmux integration fixes ([482b461](https://github.com/swibrow/agent-ops/commit/482b4618a02003324d022522485d218cb3e03a6c))
+* web UI, transcript ingest, and activity review ([faa82bf](https://github.com/swibrow/agent-ops/commit/faa82bfe4bfcddd7f7e899ec5314ceead6ddfe0a))
+
 ## [0.4.0](https://github.com/swibrow/agent-ops/compare/v0.3.0...v0.4.0) (2026-03-21)
 
 
