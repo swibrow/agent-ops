@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   release-please:
-    runs-on: ubuntu-latest
+    runs-on: agent-ops
     outputs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
@@ -81,7 +81,7 @@ jobs:
 
   publish:
     needs: [release-please, build]
-    runs-on: ubuntu-latest
+    runs-on: agent-ops
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -100,7 +100,7 @@ jobs:
 
   homebrew:
     needs: [release-please, publish]
-    runs-on: ubuntu-latest
+    runs-on: agent-ops
     steps:
       - uses: actions/checkout@v4
 
