@@ -21,7 +21,7 @@ unicode-width = "0.2"
 notify-rust = "4.12.0"
 clap = { version = "4.6.0", features = ["derive"] }
 futures = "0.3.32"
-toml = "0.8"
+toml = "1.0"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
 rust-embed = "8"
